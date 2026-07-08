@@ -12,6 +12,25 @@ const SUPERVISOR_SYSTEM_PROMPT = [
 	"Track delegated evidence and decide the next supervisor action.",
 ].join(" ");
 
+type LoopEventKind = "loop.started" | "loop.paused" | "loop.resumed" | "loop.cleared";
+
+type LoopEventPayload = Record<string, unknown>;
+
+function formatLoopStatus(state: LoopState): string {
+	if (state.state === "idle") {
+		return `Loop state: ${state.state}`;
+	}
+
+	const elapsedSeconds = state.startedAt === undefined ? 0 : Math.floor((Date.now() - state.startedAt) / 1000);
+	const tokenBudget = state.maxTokens === undefined ? "" : `\nMax tokens: ${state.maxTokens}`;
+	return (
+		`Loop state: ${state.state}\n` +
+		`Objective: ${state.objective}\n` +
+		`Iterations: ${state.iterationsUsed}/${state.maxIterations}\n` +
+		`Elapsed: ${elapsedSeconds}s${tokenBudget}`
+	);
+}
+
 /**
  * Pi extension entrypoint for pi-loop.
  */
@@ -23,6 +42,19 @@ export default function piLoop(pi: ExtensionAPI): void {
 
 	function persist(state = loopState) {
 		pi.appendEntry("loop-state", state);
+	}
+
+	function appendLoopEvent(kind: LoopEventKind, payload: LoopEventPayload = {}) {
+		const sequence = (loopState.sequence ?? 0) + 1;
+		loopState = { ...loopState, sequence };
+		pi.appendEntry("loop-event", {
+			schemaVersion: 1,
+			runId: loopState.runId,
+			sequence,
+			timestamp: Date.now(),
+			kind,
+			payload,
+		});
 	}
 
 	function installRestrictions(): string | undefined {
@@ -118,6 +150,7 @@ export default function piLoop(pi: ExtensionAPI): void {
 
 			loopState = activeLoopState(params);
 			controlFiles.set("objective.md", params.objective);
+			appendLoopEvent("loop.started", { objective: params.objective });
 			persist();
 			return textResult("Loop supervisor mode started.");
 		},
@@ -130,8 +163,9 @@ export default function piLoop(pi: ExtensionAPI): void {
 		parameters: Type.Object({
 			reason: Type.Optional(Type.String()),
 		}),
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			loopState = { ...loopState, state: "paused" };
+			appendLoopEvent("loop.paused", { reason: params.reason });
 			ctx.abort();
 			restorePreLoopTools();
 			persist();
@@ -150,6 +184,7 @@ export default function piLoop(pi: ExtensionAPI): void {
 				throw new Error(error);
 			}
 			loopState = { ...loopState, state: "active" };
+			appendLoopEvent("loop.resumed");
 			persist();
 			return textResult("Loop supervisor mode resumed.");
 		},
@@ -186,7 +221,7 @@ export default function piLoop(pi: ExtensionAPI): void {
 		description: "Show current loop supervisor state.",
 		parameters: Type.Object({}),
 		async execute() {
-			return textResult(`Loop state: ${loopState.state}`);
+			return textResult(formatLoopStatus(loopState));
 		},
 	});
 
@@ -220,6 +255,20 @@ export default function piLoop(pi: ExtensionAPI): void {
 
 			controlFiles.set(params.file, params.content);
 			return textResult(`Wrote loop control artifact ${params.file}.`);
+		},
+	});
+
+	pi.registerTool({
+		name: "loop_clear",
+		label: "Loop Clear",
+		description: "Clear the active loop state and restore the pre-loop tool surface.",
+		parameters: Type.Object({}),
+		async execute() {
+			appendLoopEvent("loop.cleared");
+			loopState = initialLoopState();
+			restorePreLoopTools();
+			persist();
+			return textResult("Loop state cleared; idle state restored.");
 		},
 	});
 }

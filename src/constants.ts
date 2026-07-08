@@ -6,6 +6,7 @@ export const SUPERVISOR_TOOL_NAMES = [
 	"loop_status",
 	"loop_delegate",
 	"loop_write",
+	"loop_clear",
 ] as const;
 
 export type SupervisorToolName = (typeof SUPERVISOR_TOOL_NAMES)[number];

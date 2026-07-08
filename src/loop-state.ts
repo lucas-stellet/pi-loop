@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { requirementsFromObjective } from "./completion.ts";
@@ -11,6 +13,9 @@ export type LoopState = {
 	maxIterations: number;
 	iterationsUsed: number;
 	maxTokens?: number;
+	runId?: string;
+	sequence?: number;
+	startedAt?: number;
 };
 
 type SessionEntry = {
@@ -40,6 +45,9 @@ export function activeLoopState(params: {
 		requirements: requirementsFromObjective(params.objective),
 		maxIterations: params.maxIterations ?? 10,
 		iterationsUsed: 0,
+		runId: randomUUID(),
+		sequence: 0,
+		startedAt: Date.now(),
 		...(params.maxTokens === undefined ? {} : { maxTokens: params.maxTokens }),
 	};
 }

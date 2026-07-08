@@ -11,6 +11,7 @@ const SUPERVISOR_TOOLS = [
 	"loop_status",
 	"loop_delegate",
 	"loop_write",
+	"loop_clear",
 ] as const;
 
 const PRE_LOOP_TOOLS = ["read", "bash", "write", "grep", "find", "ls", "edit"];
@@ -144,6 +145,21 @@ function resultText(result: ToolResult): string {
 	return result.content?.map((part) => part.text).join("\n") ?? "";
 }
 
+type LoopEvent = {
+	schemaVersion?: number;
+	runId?: unknown;
+	sequence?: unknown;
+	timestamp?: unknown;
+	kind?: unknown;
+	payload?: unknown;
+};
+
+function loopEvents(harness: ReturnType<typeof createHarness>) {
+	return harness.appendEntries
+		.filter((entry) => entry.customType === "loop-event")
+		.map((entry) => entry.data as LoopEvent);
+}
+
 test("registers the supervisor-only loop tool surface", () => {
 	const harness = createHarness();
 
@@ -182,6 +198,69 @@ test("loop_start enters active state, installs the supervisor allowlist, and run
 		harness.ctx,
 	);
 	assert.equal(allowed, undefined);
+});
+
+test("loop_status reports rich lifecycle details for an active loop", async () => {
+	const harness = createHarness();
+	piLoop(harness.pi as never);
+
+	await executeTool(harness, "loop_start", {
+		objective: "Ship rich lifecycle status",
+		maxIterations: 3,
+		maxTokens: 123,
+	});
+
+	const status = await executeTool(harness, "loop_status", {});
+	const text = resultText(status);
+	assert.match(text, /active/i);
+	assert.match(text, /Ship rich lifecycle status/);
+	assert.match(text, /0\s*\/\s*3/);
+	assert.match(text, /elapsed/i);
+	assert.match(text, /123/);
+});
+
+test("loop_clear removes active loop state and restores pre-loop tools", async () => {
+	const harness = createHarness();
+	piLoop(harness.pi as never);
+	await executeTool(harness, "loop_start", { objective: "Clear this loop" });
+
+	const cleared = await executeTool(harness, "loop_clear", {});
+
+	assert.match(resultText(cleared), /clear|idle|reset/i);
+	assert.equal(lastLoopState(harness).state, "idle");
+	assert.deepEqual(harness.setActiveToolsCalls.at(-1), PRE_LOOP_TOOLS);
+
+	const status = await executeTool(harness, "loop_status", {});
+	assert.match(resultText(status), /idle/i);
+});
+
+test("loop lifecycle transitions append ordered journal events with metadata", async () => {
+	const harness = createHarness();
+	piLoop(harness.pi as never);
+
+	await executeTool(harness, "loop_start", { objective: "Journal lifecycle", maxIterations: 2 });
+	await executeTool(harness, "loop_pause", { reason: "verify pause event" });
+	await executeTool(harness, "loop_resume", {});
+
+	const events = loopEvents(harness);
+	assert.equal(events.length, 3);
+	assert.deepEqual(
+		events.map((event) => event.kind),
+		["loop.started", "loop.paused", "loop.resumed"],
+	);
+
+	const [runId] = events.map((event) => event.runId);
+	assert.equal(typeof runId, "string");
+	assert.ok(runId);
+	for (const [index, event] of events.entries()) {
+		assert.equal(event.schemaVersion, 1);
+		assert.equal(event.runId, runId);
+		assert.equal(event.sequence, index + 1);
+		assert.equal(typeof event.timestamp, "number");
+		assert.ok((event.timestamp as number) > 0);
+		assert.equal(typeof event.payload, "object");
+		assert.notEqual(event.payload, null);
+	}
 });
 
 test("loop_start throws instead of entering a degraded loop when tool restrictions cannot be installed", async () => {
