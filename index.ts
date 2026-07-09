@@ -143,6 +143,10 @@ export default function piLoop(pi: ExtensionAPI): void {
 			maxTokens: Type.Optional(Type.Number()),
 		}),
 		async execute(_toolCallId, params) {
+			if (loopState.state !== "idle") {
+				throw new Error("loop_start requires idle loop state; refusing to start a new loop.");
+			}
+
 			const error = installRestrictions();
 			if (error) {
 				throw new Error(error);
@@ -179,6 +183,10 @@ export default function piLoop(pi: ExtensionAPI): void {
 		description: "Resume loop supervisor mode and reinstall restricted supervisor tools.",
 		parameters: Type.Object({}),
 		async execute() {
+			if (loopState.state !== "paused") {
+				throw new Error("loop_resume requires a paused loop state; refusing to resume.");
+			}
+
 			const error = installRestrictions();
 			if (error) {
 				throw new Error(error);

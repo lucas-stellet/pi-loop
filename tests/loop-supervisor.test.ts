@@ -15,6 +15,7 @@ const SUPERVISOR_TOOLS = [
 ] as const;
 
 const PRE_LOOP_TOOLS = ["read", "bash", "write", "grep", "find", "ls", "edit"];
+const PROHIBITED_BUILT_IN_TOOLS = [...PRE_LOOP_TOOLS];
 
 type RegisteredTool = {
 	name: string;
@@ -160,6 +161,56 @@ function loopEvents(harness: ReturnType<typeof createHarness>) {
 		.map((entry) => entry.data as LoopEvent);
 }
 
+function requiredHandler(
+	harness: ReturnType<typeof createHarness>,
+	eventName: string,
+	message: string,
+): Function {
+	const [handler] = harness.handlers.get(eventName) ?? [];
+	assert.ok(handler, message);
+	return handler;
+}
+
+function persistedLoopStateEntry(state: "active" | "paused", objective: string) {
+	return {
+		type: "custom",
+		customType: "loop-state",
+		data: {
+			state,
+			objective,
+			requirements: [],
+			maxIterations: 3,
+			iterationsUsed: 0,
+		},
+	};
+}
+
+function sessionCompactEvent() {
+	return {
+		type: "session_compact",
+		reason: "manual",
+		willRetry: false,
+		fromExtension: false,
+		compactionEntry: {},
+	};
+}
+
+async function assertLoopGuardBlocksTool(
+	toolCallGuard: Function,
+	harness: ReturnType<typeof createHarness>,
+	toolName: string,
+	toolCallId = `blocked-${toolName}`,
+): Promise<void> {
+	const result = await toolCallGuard(
+		{ type: "tool_call", toolCallId, toolName, input: {} },
+		harness.ctx,
+	);
+	assert.deepEqual(result, {
+		block: true,
+		reason: `Loop mode: tool '${toolName}' is not on the supervisor allowlist.`,
+	});
+}
+
 test("registers the supervisor-only loop tool surface", () => {
 	const harness = createHarness();
 
@@ -181,23 +232,58 @@ test("loop_start enters active state, installs the supervisor allowlist, and run
 	assert.deepEqual(harness.setActiveToolsCalls.at(-1), SUPERVISOR_TOOLS);
 	assert.equal(lastLoopState(harness).state, "active");
 
-	const [toolCallGuard] = harness.handlers.get("tool_call") ?? [];
-	assert.ok(toolCallGuard, "loop mode must install a tool_call runtime guard");
+	const toolCallGuard = requiredHandler(harness, "tool_call", "loop mode must install a tool_call runtime guard");
 
-	const blocked = await toolCallGuard(
-		{ type: "tool_call", toolCallId: "blocked", toolName: "bash", input: { command: "npm test" } },
-		harness.ctx,
-	);
-	assert.deepEqual(blocked, {
-		block: true,
-		reason: "Loop mode: tool 'bash' is not on the supervisor allowlist.",
-	});
+	await assertLoopGuardBlocksTool(toolCallGuard, harness, "bash", "blocked");
 
 	const allowed = await toolCallGuard(
 		{ type: "tool_call", toolCallId: "allowed", toolName: "loop_status", input: {} },
 		harness.ctx,
 	);
 	assert.equal(allowed, undefined);
+});
+
+test("active loop tool surface contains only supervisor tools and no prohibited built-ins", async () => {
+	const harness = createHarness();
+	piLoop(harness.pi as never);
+
+	await executeTool(harness, "loop_start", { objective: "Verify restricted active tools" });
+
+	for (const tool of PROHIBITED_BUILT_IN_TOOLS) {
+		assert.ok(!harness.activeTools.includes(tool), `${tool} should not be active in loop mode`);
+	}
+	for (const tool of SUPERVISOR_TOOLS) {
+		assert.ok(harness.activeTools.includes(tool), `${tool} should be active in loop mode`);
+	}
+	assert.equal(harness.activeTools.length, SUPERVISOR_TOOLS.length);
+});
+
+test("tool_call guard blocks every prohibited built-in during active loop", async () => {
+	const harness = createHarness();
+	piLoop(harness.pi as never);
+	await executeTool(harness, "loop_start", { objective: "Block prohibited built-ins" });
+
+	const toolCallGuard = requiredHandler(harness, "tool_call", "loop mode must install a tool_call runtime guard");
+
+	for (const toolName of PROHIBITED_BUILT_IN_TOOLS) {
+		await assertLoopGuardBlocksTool(toolCallGuard, harness, toolName);
+	}
+});
+
+test("tool_call guard allows every supervisor tool during active loop", async () => {
+	const harness = createHarness();
+	piLoop(harness.pi as never);
+	await executeTool(harness, "loop_start", { objective: "Allow supervisor tools" });
+
+	const toolCallGuard = requiredHandler(harness, "tool_call", "loop mode must install a tool_call runtime guard");
+
+	for (const toolName of SUPERVISOR_TOOLS) {
+		const result = await toolCallGuard(
+			{ type: "tool_call", toolCallId: `allowed-${toolName}`, toolName, input: {} },
+			harness.ctx,
+		);
+		assert.equal(result, undefined);
+	}
 });
 
 test("loop_status reports rich lifecycle details for an active loop", async () => {
@@ -229,6 +315,7 @@ test("loop_clear removes active loop state and restores pre-loop tools", async (
 	assert.match(resultText(cleared), /clear|idle|reset/i);
 	assert.equal(lastLoopState(harness).state, "idle");
 	assert.deepEqual(harness.setActiveToolsCalls.at(-1), PRE_LOOP_TOOLS);
+	assert.deepEqual(harness.activeTools, PRE_LOOP_TOOLS);
 
 	const status = await executeTool(harness, "loop_status", {});
 	assert.match(resultText(status), /idle/i);
@@ -275,11 +362,19 @@ test("loop_start throws instead of entering a degraded loop when tool restrictio
 		/setActiveTools|tool restriction|refus/i,
 	);
 	assert.equal(harness.appendEntries.some((entry) => (entry.data as { state?: string })?.state === "active"), false);
+	assert.equal(harness.appendEntries.some((entry) => entry.customType === "loop-state"), false);
+	assert.equal(harness.appendEntries.some((entry) => entry.customType === "loop-event"), false);
 });
 
 test("loop_resume throws when supervisor tool restrictions cannot be reinstalled", async () => {
 	const harness = createHarness({ failSetActiveTools: true });
 	piLoop(harness.pi as never);
+	harness.setSessionEntries([
+		persistedLoopStateEntry("paused", "Resume only with enforceable restrictions"),
+	]);
+
+	const sessionStart = requiredHandler(harness, "session_start", "loop state must be recoverable on session_start");
+	await sessionStart({ type: "session_start", reason: "reload" }, harness.ctx);
 
 	await assert.rejects(
 		() => executeTool(harness, "loop_resume", {}),
@@ -353,6 +448,7 @@ test("loop_complete throws for empty, contradictory, and missing-evidence summar
 	assert.match(resultText(complete), /complete/i);
 	assert.equal(lastLoopState(harness).state, "complete");
 	assert.deepEqual(harness.setActiveToolsCalls.at(-1), PRE_LOOP_TOOLS);
+	assert.deepEqual(harness.activeTools, PRE_LOOP_TOOLS);
 });
 
 test("before_agent_start injects a supervisor control-plane prompt while loop mode is active", async () => {
@@ -416,6 +512,7 @@ test("pause, resume, and reload recovery expose explicit loop states", async () 
 	assert.match(resultText(paused), /paused/i);
 	assert.equal(lastLoopState(harness).state, "paused");
 	assert.deepEqual(harness.setActiveToolsCalls.at(-1), PRE_LOOP_TOOLS);
+	assert.deepEqual(harness.activeTools, PRE_LOOP_TOOLS);
 	assert.equal(harness.aborted, true);
 
 	const resumed = await executeTool(harness, "loop_resume", {});
@@ -434,26 +531,29 @@ test("active session reload reinstalls the restricted supervisor tool surface", 
 	const harness = createHarness();
 	piLoop(harness.pi as never);
 	harness.setSessionEntries([
-		{
-			type: "custom",
-			customType: "loop-state",
-			data: {
-				state: "active",
-				objective: "Recovered active loop",
-				requirements: [],
-				maxIterations: 3,
-				iterationsUsed: 0,
-			},
-		},
+		persistedLoopStateEntry("active", "Recovered active loop"),
 	]);
 
-	const [sessionStart] = harness.handlers.get("session_start") ?? [];
-	assert.ok(sessionStart, "loop state must be recoverable on session_start");
+	const sessionStart = requiredHandler(harness, "session_start", "loop state must be recoverable on session_start");
 	await sessionStart({ type: "session_start", reason: "reload" }, harness.ctx);
 
 	assert.deepEqual(harness.setActiveToolsCalls.at(-1), SUPERVISOR_TOOLS);
 	const statusAfterReload = await executeTool(harness, "loop_status", {});
 	assert.match(resultText(statusAfterReload), /active/);
+});
+
+test("tool_call guard blocks prohibited tools after session_start recovery of active loop", async () => {
+	const harness = createHarness();
+	piLoop(harness.pi as never);
+	harness.setSessionEntries([
+		persistedLoopStateEntry("active", "Recovered active loop"),
+	]);
+
+	const sessionStart = requiredHandler(harness, "session_start", "loop state must be recoverable on session_start");
+	await sessionStart({ type: "session_start", reason: "reload" }, harness.ctx);
+
+	const toolCallGuard = requiredHandler(harness, "tool_call", "recovered active loop must keep the tool_call runtime guard");
+	await assertLoopGuardBlocksTool(toolCallGuard, harness, "bash", "blocked-after-session-start");
 });
 
 test("session_before_compact persists a fresh loop-state marker for non-idle loops", async () => {
@@ -484,33 +584,60 @@ test("session_compact rehydrates active loop state and reinstalls supervisor res
 	const harness = createHarness();
 	piLoop(harness.pi as never);
 	harness.setSessionEntries([
-		{
-			type: "custom",
-			customType: "loop-state",
-			data: {
-				state: "active",
-				objective: "Recovered after compaction",
-				requirements: [],
-				maxIterations: 3,
-				iterationsUsed: 0,
-			},
-		},
+		persistedLoopStateEntry("active", "Recovered after compaction"),
 	]);
 
-	const [sessionCompact] = harness.handlers.get("session_compact") ?? [];
-	assert.ok(sessionCompact, "loop mode must install a session_compact recovery hook");
-	await sessionCompact(
-		{
-			type: "session_compact",
-			reason: "manual",
-			willRetry: false,
-			fromExtension: false,
-			compactionEntry: {},
-		},
-		harness.ctx,
-	);
+	const sessionCompact = requiredHandler(harness, "session_compact", "loop mode must install a session_compact recovery hook");
+	await sessionCompact(sessionCompactEvent(), harness.ctx);
 
 	assert.deepEqual(harness.setActiveToolsCalls.at(-1), SUPERVISOR_TOOLS);
 	const statusAfterCompact = await executeTool(harness, "loop_status", {});
 	assert.match(resultText(statusAfterCompact), /active/);
+});
+
+test("tool_call guard blocks prohibited tools after session_compact recovery of active loop", async () => {
+	const harness = createHarness();
+	piLoop(harness.pi as never);
+	harness.setSessionEntries([
+		persistedLoopStateEntry("active", "Recovered after compaction"),
+	]);
+
+	const sessionCompact = requiredHandler(harness, "session_compact", "loop mode must install a session_compact recovery hook");
+	await sessionCompact(sessionCompactEvent(), harness.ctx);
+
+	const toolCallGuard = requiredHandler(harness, "tool_call", "recovered active loop must keep the tool_call runtime guard");
+	await assertLoopGuardBlocksTool(toolCallGuard, harness, "bash", "blocked-after-session-compact");
+});
+
+test("loop_start cannot re-enter active loop and corrupt pre-loop tool restoration", async () => {
+	const harness = createHarness();
+	piLoop(harness.pi as never);
+	await executeTool(harness, "loop_start", { objective: "Original loop keeps original tools" });
+
+	await assert.rejects(
+		() => executeTool(harness, "loop_start", { objective: "Nested loop must be rejected" }),
+		/active|idle|state|refus/i,
+	);
+
+	await executeTool(harness, "loop_pause", { reason: "verify original tool surface" });
+
+	assert.deepEqual(harness.activeTools, PRE_LOOP_TOOLS);
+});
+
+test("active compaction recovery cannot corrupt pre-loop tool restoration", async () => {
+	const harness = createHarness();
+	piLoop(harness.pi as never);
+	await executeTool(harness, "loop_start", { objective: "Recover active loop without losing tools" });
+
+	const sessionCompact = requiredHandler(harness, "session_compact", "loop mode must install a session_compact recovery hook");
+	await sessionCompact(sessionCompactEvent(), harness.ctx);
+
+	await assert.rejects(
+		() => executeTool(harness, "loop_resume", {}),
+		/active|paused|state/i,
+	);
+
+	await executeTool(harness, "loop_pause", { reason: "verify restored tool surface" });
+
+	assert.deepEqual(harness.activeTools, PRE_LOOP_TOOLS);
 });
