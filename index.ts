@@ -3,6 +3,7 @@ import { Type } from "typebox";
 
 import { isLoopControlFile, isSupervisorToolName, SUPERVISOR_TOOL_NAMES } from "./src/constants.ts";
 import { summaryReportsFailure, validateCompletionSummary } from "./src/completion.ts";
+import { createJournal } from "./src/journal.ts";
 import { activeLoopState, initialLoopState, lastPersistedLoopState, type LoopState } from "./src/loop-state.ts";
 import { textResult } from "./src/tool-result.ts";
 
@@ -39,22 +40,21 @@ export default function piLoop(pi: ExtensionAPI): void {
 	let preLoopTools: string[] = [];
 	let guardActive = false;
 	const controlFiles = new Map<string, string>();
+	const journal = createJournal((customType, data) => pi.appendEntry(customType, data));
+
+	function syncJournalRun(state: LoopState) {
+		if (state.runId) {
+			journal.startRun(state.runId, state.sequence ?? 0);
+		}
+	}
 
 	function persist(state = loopState) {
-		pi.appendEntry("loop-state", state);
+		journal.updateSnapshot(state);
 	}
 
 	function appendLoopEvent(kind: LoopEventKind, payload: LoopEventPayload = {}) {
-		const sequence = (loopState.sequence ?? 0) + 1;
-		loopState = { ...loopState, sequence };
-		pi.appendEntry("loop-event", {
-			schemaVersion: 1,
-			runId: loopState.runId,
-			sequence,
-			timestamp: Date.now(),
-			kind,
-			payload,
-		});
+		journal.appendEvent(kind, payload);
+		loopState = { ...loopState, sequence: journal.getSequence() };
 	}
 
 	function installRestrictions(): string | undefined {
@@ -85,6 +85,7 @@ export default function piLoop(pi: ExtensionAPI): void {
 		}
 
 		loopState = recovered;
+		syncJournalRun(recovered);
 		guardActive = recovered.state === "active";
 		if (guardActive) {
 			pi.setActiveTools([...SUPERVISOR_TOOL_NAMES]);
@@ -153,6 +154,7 @@ export default function piLoop(pi: ExtensionAPI): void {
 			}
 
 			loopState = activeLoopState(params);
+			syncJournalRun(loopState);
 			controlFiles.set("objective.md", params.objective);
 			appendLoopEvent("loop.started", { objective: params.objective });
 			persist();
