@@ -15,7 +15,10 @@ export const LOOP_CONTROL_FILES = [
 	"objective.md",
 	"plan.md",
 	"state.md",
+	"nits.md",
 	"decisions.md",
+	"delegations.md",
+	"checklist.md",
 	"evidence.md",
 	"completion-checklist.md",
 ] as const;

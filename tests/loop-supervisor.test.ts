@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, before, test } from "node:test";
 
+import { LOOP_CONTROL_FILES } from "../src/constants.ts";
 import piLoop from "../index.ts";
 
 const SUPERVISOR_TOOLS = [
@@ -16,6 +20,19 @@ const SUPERVISOR_TOOLS = [
 
 const PRE_LOOP_TOOLS = ["read", "bash", "write", "grep", "find", "ls", "edit"];
 const PROHIBITED_BUILT_IN_TOOLS = [...PRE_LOOP_TOOLS];
+
+let harnessRoot = "";
+let harnessCwd = "";
+
+before(async () => {
+	harnessRoot = await mkdtemp(join(tmpdir(), "pi-loop-harness-test-"));
+	harnessCwd = join(harnessRoot, "project");
+	await mkdir(harnessCwd);
+});
+
+after(async () => {
+	await rm(harnessRoot, { recursive: true, force: true });
+});
 
 type RegisteredTool = {
 	name: string;
@@ -48,7 +65,11 @@ type MockContext = {
 	};
 };
 
-function createHarness(options: { failSetActiveTools?: boolean } = {}) {
+function createHarness(options: {
+	cwd?: string;
+	failAppendEntry?: (customType: string, data: unknown) => boolean;
+	failSetActiveTools?: boolean;
+} = {}) {
 	const tools = new Map<string, RegisteredTool>();
 	const handlers = new Map<string, Function[]>();
 	const setActiveToolsCalls: string[][] = [];
@@ -78,13 +99,16 @@ function createHarness(options: { failSetActiveTools?: boolean } = {}) {
 			activeTools = [...names];
 		},
 		appendEntry(customType: string, data: unknown) {
+			if (options.failAppendEntry?.(customType, data)) {
+				throw new Error("journal unavailable");
+			}
 			appendEntries.push({ customType, data });
 			sessionEntries.push({ type: "custom", customType, data });
 		},
 	};
 
 	const ctx: MockContext = {
-		cwd: "/tmp/pi-loop-test",
+		cwd: options.cwd ?? harnessCwd,
 		hasUI: false,
 		mode: "tui",
 		sessionManager: {
@@ -139,6 +163,8 @@ function lastLoopState(harness: ReturnType<typeof createHarness>) {
 		objective?: string;
 		maxIterations?: number;
 		iterationsUsed?: number;
+		runId?: string;
+		sequence?: number;
 	};
 }
 
@@ -382,25 +408,202 @@ test("loop_resume throws when supervisor tool restrictions cannot be reinstalled
 	);
 });
 
-test("loop_write accepts only loop-scoped markdown control artifacts and throws for rejected paths", async () => {
-	const harness = createHarness();
-	piLoop(harness.pi as never);
-	await executeTool(harness, "loop_start", { objective: "Keep writes scoped to loop control files" });
+async function withTemporaryCwd(run: (cwd: string) => Promise<void>) {
+	const root = await mkdtemp(join(tmpdir(), "pi-loop-control-test-"));
+	const cwd = join(root, "project");
+	await mkdir(cwd);
+	try {
+		await run(cwd);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+}
 
-	const allowed = await executeTool(harness, "loop_write", {
-		file: "objective.md",
-		content: "# Objective\nKeep loop writes scoped.",
+function activeControlDirectory(harness: ReturnType<typeof createHarness>) {
+	const runId = lastLoopState(harness).runId;
+	if (typeof runId !== "string" || runId.length === 0) {
+		assert.fail("active state must persist its run identity");
+	}
+	return join(harness.ctx.cwd, ".pi", "loop", runId);
+}
+
+function assertGuardrailJournaled(
+	harness: ReturnType<typeof createHarness>,
+	entriesBefore: number,
+	expected: { file: string; reason: "disallowed_file" | "symlink_destination" | "unsafe_destination" },
+): LoopEvent {
+	const appended = harness.appendEntries.slice(entriesBefore);
+	assert.equal(appended[0]?.customType, "loop-event", "guardrail event must precede rejection visibility");
+	const event = appended[0]?.data as LoopEvent;
+	assert.equal(event.kind, "loop.guardrail_violation");
+	assert.deepEqual(event.payload, {
+		tool: "loop_write",
+		file: expected.file,
+		reason: expected.reason,
 	});
-	assert.match(resultText(allowed), /Wrote loop control artifact objective\.md/i);
+	assert.equal("content" in (event.payload as object), false);
+	assert.equal(typeof event.sequence, "number");
+	assert.equal(appended[1]?.customType, "loop-state", "guardrail sequence must be snapshotted before rejection");
+	assert.equal((appended[1]?.data as { sequence?: unknown }).sequence, event.sequence);
+	return event;
+}
 
-	await assert.rejects(
-		() =>
-			executeTool(harness, "loop_write", {
-				file: "src/index.ts",
-				content: "// supervisor must not edit implementation files",
-			}),
-		/loop-scoped|control|outside|Rejected/i,
-	);
+test("loop_start creates its run control directory and loop_write persists every approved artifact", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		const harness = createHarness({ cwd });
+		piLoop(harness.pi as never);
+		await executeTool(harness, "loop_start", { objective: "Persist the control objective" });
+
+		const controlDir = activeControlDirectory(harness);
+		assert.equal(await readFile(join(controlDir, "objective.md"), "utf8"), "Persist the control objective");
+
+		for (const file of LOOP_CONTROL_FILES) {
+			const content = `# ${file}\nUTF-8 ✓`;
+			await executeTool(harness, "loop_write", { file, content });
+			assert.equal(await readFile(join(controlDir, file), "utf8"), content);
+		}
+	});
+});
+
+test("loop_write rejects path and name policy violations without outside mutations and journals them", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		const harness = createHarness({ cwd });
+		piLoop(harness.pi as never);
+		await executeTool(harness, "loop_start", { objective: "Reject unsafe control paths" });
+		const outside = join(cwd, "..", "outside.txt");
+		await writeFile(outside, "unchanged", "utf8");
+
+		const guardrailSequences: number[] = [];
+		for (const file of [outside, "../outside.txt", "notes/plan.md", "arbitrary.md", "plan.txt", "src/index.ts"]) {
+			const entriesBefore = harness.appendEntries.length;
+			await assert.rejects(() => executeTool(harness, "loop_write", { file, content: "secret content" }));
+			assert.equal(await readFile(outside, "utf8"), "unchanged");
+			const event = assertGuardrailJournaled(harness, entriesBefore, {
+				file,
+				reason: "disallowed_file",
+			});
+			guardrailSequences.push(event.sequence as number);
+		}
+		for (let index = 1; index < guardrailSequences.length; index += 1) {
+			assert.ok(
+				guardrailSequences[index]! > guardrailSequences[index - 1]!,
+				"successive guardrail event sequences must be strictly monotonic",
+			);
+		}
+	});
+});
+
+test("loop_write fails closed when its guardrail journal append fails", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		let failGuardrailAppend = false;
+		const harness = createHarness({
+			cwd,
+			failAppendEntry: (customType, data) =>
+				failGuardrailAppend && customType === "loop-event" && (data as LoopEvent).kind === "loop.guardrail_violation",
+		});
+		piLoop(harness.pi as never);
+		await executeTool(harness, "loop_start", { objective: "Fail closed on guardrail journal errors" });
+		failGuardrailAppend = true;
+
+		await assert.rejects(
+			() => executeTool(harness, "loop_write", { file: "src/index.ts", content: "must not write" }),
+			/journal unavailable/i,
+		);
+	});
+});
+
+test("loop_write refuses approved destination symlinks without changing their outside target", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		const harness = createHarness({ cwd });
+		piLoop(harness.pi as never);
+		await executeTool(harness, "loop_start", { objective: "Reject symlink escapes" });
+		const outside = join(cwd, "outside.md");
+		await writeFile(outside, "unchanged", "utf8");
+		await mkdir(activeControlDirectory(harness), { recursive: true });
+		await symlink(outside, join(activeControlDirectory(harness), "plan.md"));
+
+		const entriesBefore = harness.appendEntries.length;
+		await assert.rejects(
+			() => executeTool(harness, "loop_write", { file: "plan.md", content: "escaped" }),
+			(error: { reason?: unknown }) => {
+				assert.equal(error.reason, "symlink_destination");
+				return true;
+			},
+		);
+		assert.equal(await readFile(outside, "utf8"), "unchanged");
+		assertGuardrailJournaled(harness, entriesBefore, {
+			file: "plan.md",
+			reason: "symlink_destination",
+		});
+	});
+});
+
+test("loop_write rejects hard-linked approved destinations before mutating their outside target", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		const harness = createHarness({ cwd });
+		piLoop(harness.pi as never);
+		await executeTool(harness, "loop_start", { objective: "Reject hard-link escapes" });
+		const outside = join(cwd, "outside.md");
+		await writeFile(outside, "unchanged", "utf8");
+		await link(outside, join(activeControlDirectory(harness), "plan.md"));
+		const entriesBefore = harness.appendEntries.length;
+
+		await assert.rejects(
+			() => executeTool(harness, "loop_write", { file: "plan.md", content: "escaped" }),
+			(error: { reason?: unknown }) => {
+				assert.equal(error.reason, "unsafe_destination");
+				return true;
+			},
+		);
+		assert.equal(await readFile(outside, "utf8"), "unchanged");
+		assertGuardrailJournaled(harness, entriesBefore, {
+			file: "plan.md",
+			reason: "unsafe_destination",
+		});
+	});
+});
+
+test("loop_write rejects non-regular approved destinations as unsafe", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		const harness = createHarness({ cwd });
+		piLoop(harness.pi as never);
+		await executeTool(harness, "loop_start", { objective: "Reject non-regular destinations" });
+		await mkdir(join(activeControlDirectory(harness), "plan.md"));
+		const entriesBefore = harness.appendEntries.length;
+
+		await assert.rejects(
+			() => executeTool(harness, "loop_write", { file: "plan.md", content: "escaped" }),
+			(error: { reason?: unknown }) => {
+				assert.equal(error.reason, "unsafe_destination");
+				return true;
+			},
+		);
+		assertGuardrailJournaled(harness, entriesBefore, {
+			file: "plan.md",
+			reason: "unsafe_destination",
+		});
+	});
+});
+
+test("only generated loop controls are ignored", async () => {
+	const gitignore = await readFile(new URL("../.gitignore", import.meta.url), "utf8");
+	assert.match(gitignore, /^\.pi\/loop\/$/m);
+	assert.doesNotMatch(gitignore, /^\.pi\/$/m);
+});
+
+test("reload and compaction retain the persisted run control directory", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		const harness = createHarness({ cwd });
+		piLoop(harness.pi as never);
+		await executeTool(harness, "loop_start", { objective: "Keep the run directory stable" });
+		const controlDir = activeControlDirectory(harness);
+
+		await requiredHandler(harness, "session_start", "reload handler required")({ type: "session_start", reason: "reload" }, harness.ctx);
+		await requiredHandler(harness, "session_compact", "compaction handler required")(sessionCompactEvent(), harness.ctx);
+		await executeTool(harness, "loop_write", { file: "state.md", content: "recovered state" });
+
+		assert.equal(await readFile(join(controlDir, "state.md"), "utf8"), "recovered state");
+	});
 });
 
 test("loop_complete throws for empty, contradictory, and missing-evidence summaries before accepting requirement evidence", async () => {

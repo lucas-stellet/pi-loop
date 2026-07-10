@@ -1,7 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-import { isLoopControlFile, isSupervisorToolName, SUPERVISOR_TOOL_NAMES } from "./src/constants.ts";
+import { isSupervisorToolName, SUPERVISOR_TOOL_NAMES } from "./src/constants.ts";
+import { ControlFilePolicyError, seedControlFiles, writeControlFile } from "./src/control-files.ts";
 import { summaryReportsFailure, validateCompletionSummary } from "./src/completion.ts";
 import { createJournal } from "./src/journal.ts";
 import { activeLoopState, initialLoopState, lastPersistedLoopState, type LoopState } from "./src/loop-state.ts";
@@ -13,7 +14,7 @@ const SUPERVISOR_SYSTEM_PROMPT = [
 	"Track delegated evidence and decide the next supervisor action.",
 ].join(" ");
 
-type LoopEventKind = "loop.started" | "loop.paused" | "loop.resumed" | "loop.cleared";
+type LoopEventKind = "loop.started" | "loop.paused" | "loop.resumed" | "loop.cleared" | "loop.guardrail_violation";
 
 type LoopEventPayload = Record<string, unknown>;
 
@@ -39,7 +40,6 @@ export default function piLoop(pi: ExtensionAPI): void {
 	let loopState: LoopState = initialLoopState();
 	let preLoopTools: string[] = [];
 	let guardActive = false;
-	const controlFiles = new Map<string, string>();
 	const journal = createJournal((customType, data) => pi.appendEntry(customType, data));
 
 	function syncJournalRun(state: LoopState) {
@@ -143,19 +143,24 @@ export default function piLoop(pi: ExtensionAPI): void {
 			maxIterations: Type.Optional(Type.Number()),
 			maxTokens: Type.Optional(Type.Number()),
 		}),
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (loopState.state !== "idle") {
 				throw new Error("loop_start requires idle loop state; refusing to start a new loop.");
 			}
+
+			const nextLoopState = activeLoopState(params);
+			if (!nextLoopState.runId) {
+				throw new Error("active loop state is missing run identity");
+			}
+			await seedControlFiles(ctx.cwd, nextLoopState.runId, params.objective);
 
 			const error = installRestrictions();
 			if (error) {
 				throw new Error(error);
 			}
 
-			loopState = activeLoopState(params);
+			loopState = nextLoopState;
 			syncJournalRun(loopState);
-			controlFiles.set("objective.md", params.objective);
 			appendLoopEvent("loop.started", { objective: params.objective });
 			persist();
 			return textResult("Loop supervisor mode started.");
@@ -258,12 +263,25 @@ export default function piLoop(pi: ExtensionAPI): void {
 			file: Type.String(),
 			content: Type.String(),
 		}),
-		async execute(_toolCallId, params) {
-			if (!isLoopControlFile(params.file)) {
-				throw new Error("Rejected: file is outside the loop-scoped markdown control artifacts.");
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (!loopState.runId) {
+				throw new Error("loop_write requires an active loop run.");
 			}
 
-			controlFiles.set(params.file, params.content);
+			try {
+				await writeControlFile(ctx.cwd, loopState.runId, params.file, params.content);
+			} catch (error) {
+				if (error instanceof ControlFilePolicyError) {
+					appendLoopEvent("loop.guardrail_violation", {
+						tool: "loop_write",
+						file: params.file,
+						reason: error.reason,
+					});
+					persist();
+				}
+				throw error;
+			}
+
 			return textResult(`Wrote loop control artifact ${params.file}.`);
 		},
 	});
