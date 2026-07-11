@@ -441,30 +441,41 @@ export default function piLoop(
 			if (!loopState.runId || loopState.state !== "active") {
 				throw new Error("loop_delegate requires an active loop run.");
 			}
+			const parentRunId = loopState.runId;
 			const metadata = await delegateResolver(params.name);
 			if (!metadata) {
 				throw new Error("loop_delegate requires an approved agent name.");
 			}
-			const childRunId = createChildRunId();
+			const origin = { parentRunId, childRunId: createChildRunId() };
+			const publishLifecycle = async (status: "running" | "completed") => {
+				await appendLoopEvent("delegation.updated", {
+					childId: origin.childRunId,
+					status,
+					artifactRefs: [],
+				});
+				persist();
+			};
 			await appendLoopEvent("delegation.updated", {
-				childId: childRunId,
+				childId: origin.childRunId,
 				status: "started",
 				artifactRefs: [],
 			});
-			pi.appendEntry("loop-delegation", { ...params, runId: loopState.runId, childRunId });
+			pi.appendEntry("loop-delegation", { ...params, runId: origin.parentRunId, childRunId: origin.childRunId });
 			persist();
 			try {
-				await delegateExecutor.launch({ childRunId, cwd: ctx.cwd, task: params.task, metadata });
+				const handle = await delegateExecutor.launch({ childRunId: origin.childRunId, cwd: ctx.cwd, task: params.task, metadata });
+				await publishLifecycle("running");
+				void handle.settled.then(() => publishLifecycle("completed")).catch(() => undefined);
 			} catch (error) {
 				await appendLoopEvent("delegation.updated", {
-					childId: childRunId,
+					childId: origin.childRunId,
 					status: "failed",
 					artifactRefs: [],
 				});
 				persist();
 				throw error;
 			}
-			return textResult(`Delegation started: ${childRunId}`, { childRunId });
+			return textResult(`Delegation started: ${origin.childRunId}`, { childRunId: origin.childRunId });
 		},
 	});
 

@@ -162,7 +162,7 @@ function createHarness(options: {
 function fixtureDelegateExecutor(): DelegateExecutor {
 	return {
 		async launch() {
-			return { pid: process.pid + 1, settled: Promise.resolve() };
+			return { pid: process.pid + 1, settled: new Promise<void>(() => {}) };
 		},
 	};
 }
@@ -1453,16 +1453,20 @@ test("loop_delegate publishes one canonical started association before launching
 				if (customType === "loop-event" && (data as LoopEvent).kind === "delegation.updated") {
 					const records = readFileSync(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8")
 						.trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent);
-					startedFromDisk = records.at(-1);
-					startedMirror = data as LoopEvent;
-					order.push("canonical JSONL", "started mirror");
+					if (((data as LoopEvent).payload as { status?: unknown }).status === "started") {
+						startedFromDisk = records.at(-1);
+						startedMirror = data as LoopEvent;
+						order.push("canonical JSONL", "started mirror");
+					} else {
+						order.push("running canonical JSONL", "running mirror");
+					}
 				}
 				if (customType === "loop-delegation") {
 					legacyDelegation = data as { runId?: string; childRunId?: string };
 					order.push("legacy delegation");
 				}
 				if (customType === "loop-state" && order.includes("legacy delegation")) {
-					delegationSnapshot = data as { runId?: string; sequence?: number };
+					delegationSnapshot ??= data as { runId?: string; sequence?: number };
 					order.push("delegation snapshot");
 				}
 			},
@@ -1471,7 +1475,7 @@ test("loop_delegate publishes one canonical started association before launching
 		installLoop(harness, { delegateExecutor: { async launch(request) {
 			launchChildId = request.childRunId;
 			order.push("launch");
-			return { pid: process.pid + 1, settled: Promise.resolve() };
+			return { pid: process.pid + 1, settled: new Promise<void>(() => {}) };
 		} } });
 		await executeTool(harness, "loop_start", { objective: "Publish before launching" });
 		parentRunId = lastLoopState(harness).runId as string;
@@ -1489,11 +1493,11 @@ test("loop_delegate publishes one canonical started association before launching
 		const childRunId = (result.details as { childRunId: string }).childRunId;
 
 		assert.deepEqual({ mirrors: count("loop-event"), legacy: count("loop-delegation"), snapshots: count("loop-state") }, {
-			mirrors: baseline.mirrors + 1,
+			mirrors: baseline.mirrors + 2,
 			legacy: baseline.legacy + 1,
-			snapshots: baseline.snapshots + 1,
+			snapshots: baseline.snapshots + 2,
 		});
-		assert.deepEqual(order, ["canonical JSONL", "started mirror", "legacy delegation", "delegation snapshot", "launch", "result"]);
+		assert.deepEqual(order, ["canonical JSONL", "started mirror", "legacy delegation", "delegation snapshot", "launch", "running canonical JSONL", "running mirror", "delegation snapshot", "result"]);
 		const recordedStartedFromDisk = startedFromDisk as LoopEvent | undefined;
 		const recordedStartedMirror = startedMirror as LoopEvent | undefined;
 		const recordedLegacyDelegation = legacyDelegation as { runId?: string; childRunId?: string } | undefined;
@@ -1829,55 +1833,166 @@ test("loop_delegate returns a child run id and journals its started association 
 	assert.match(resultText(delegated), new RegExp(details!.childRunId as string));
 
 	const lifecycle = loopEvents(harness).filter((event) => event.kind === "delegation.updated");
-	assert.equal(lifecycle.length, 1);
-	assert.equal(lifecycle[0]!.runId, parentRunId);
-	assert.deepEqual(lifecycle[0]!.payload, {
-		childId: details!.childRunId,
-		status: "started",
-		artifactRefs: [],
-	});
+	assert.equal(lifecycle.length, 2);
+	assert.deepEqual(lifecycle.map((event) => event.runId), [parentRunId, parentRunId]);
+	assert.deepEqual(lifecycle.map((event) => event.payload), [
+		{ childId: details!.childRunId, status: "started", artifactRefs: [] },
+		{ childId: details!.childRunId, status: "running", artifactRefs: [] },
+	]);
 });
 
-test("loop_delegate launches the approved child and returns before it settles", async () => {
-	const harness = createHarness();
-	let settleChild!: () => void;
-	const childSettled = new Promise<void>((resolve) => {
-		settleChild = resolve;
-	});
-	const launches: Array<{
-		childRunId: string;
-		cwd: string;
-		task: string;
-		metadata: { name: string };
-	}> = [];
-	const delegateExecutor: DelegateExecutor = {
-		async launch(request) {
-			launches.push(request);
-			return { pid: process.pid + 1, settled: childSettled };
-		},
-	};
-	installLoop(harness, { delegateExecutor });
-	await executeTool(harness, "loop_start", { objective: "Launch one real delegated child" });
+test("loop_delegate publishes the successful child lifecycle without waiting for settlement", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		let releaseLaunch!: () => void;
+		const launchReleased = new Promise<void>((resolve) => { releaseLaunch = resolve; });
+		let signalLaunch!: () => void;
+		const launchEntered = new Promise<void>((resolve) => { signalLaunch = resolve; });
+		let releaseSettlement!: () => void;
+		const childSettled = new Promise<void>((resolve) => { releaseSettlement = resolve; });
+		let signalRunningWrite!: () => void;
+		const runningWriteEntered = new Promise<void>((resolve) => { signalRunningWrite = resolve; });
+		let releaseRunningWrite!: () => void;
+		const runningWriteReleased = new Promise<void>((resolve) => { releaseRunningWrite = resolve; });
+		let signalCompletedSync!: () => void;
+		const completedSyncEntered = new Promise<void>((resolve) => { signalCompletedSync = resolve; });
+		let releaseCompletedSync!: () => void;
+		const completedSyncReleased = new Promise<void>((resolve) => { releaseCompletedSync = resolve; });
+		let parentRunId = "";
+		let childRunId = "";
+		let runningMirrorSawDisk = false;
+		let legacyDelegation: { runId?: unknown; childRunId?: unknown } | undefined;
+		let completedMirrors = 0;
+		let snapshotBaseline = -1;
+		const completedPublicationOrder: string[] = [];
+		const launches: Array<{ childRunId: string; cwd: string; task: string }> = [];
+		const harness = createHarness({
+			cwd,
+			onAppendEntry(customType, data) {
+				const event = data as LoopEvent;
+				const status = (event.payload as { status?: unknown } | undefined)?.status;
+				if (customType === "loop-event" && event.kind === "delegation.updated" && status === "running") {
+					const records = readFileSync(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8")
+						.trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent);
+					runningMirrorSawDisk = records.some((record) => (record.payload as { status?: unknown }).status === "running");
+				}
+				if (customType === "loop-event" && event.kind === "delegation.updated" && event.runId === parentRunId
+					&& (event.payload as { childId?: unknown }).childId === childRunId && status === "completed") {
+					completedMirrors += 1;
+					completedPublicationOrder.push("completed mirror");
+				}
+				if (customType === "loop-delegation") legacyDelegation = data as { runId?: unknown; childRunId?: unknown };
+				if (customType === "loop-state" && snapshotBaseline >= 0) completedPublicationOrder.push("loop-state");
+			},
+		});
+		installLoop(harness, {
+			delegateExecutor: {
+				async launch(request) {
+					launches.push(request);
+					signalLaunch();
+					await launchReleased;
+					return { pid: process.pid + 1, settled: childSettled };
+				},
+			},
+		});
 
-	const delegated = await executeTool(harness, "loop_delegate", {
-		name: "delegate",
-		task: "Write one child-owned marker file",
-	});
-	const childRunId = (delegated.details as { childRunId?: string }).childRunId;
+		await withFileHandleMethod("writeFile", (original) => async function writeFile(this: FileHandle, data: string | Uint8Array, options?: unknown) {
+			const text = typeof data === "string" ? data : Buffer.from(data).toString("utf8");
+			if (text.includes('"kind":"delegation.updated"') && text.includes('"status":"running"')) {
+				signalRunningWrite();
+				await runningWriteReleased;
+			}
+			return (original as (data: string | Uint8Array, options?: unknown) => Promise<void>).call(this, data, options);
+		}, async () => {
+			await withFileHandleMethod("sync", (original) => async function sync(this: FileHandle) {
+				if (childRunId && parentRunId && completedMirrors === 0) {
+					signalCompletedSync();
+					await completedSyncReleased;
+				}
+				return (original as () => Promise<void>).call(this);
+			}, async () => {
+				await executeTool(harness, "loop_start", { objective: "Track one successful child" });
+				parentRunId = lastLoopState(harness).runId as string;
+				let result: ToolResult | undefined;
+				const delegation = executeTool(harness, "loop_delegate", {
+					name: "delegate",
+					task: "Write one child-owned marker file",
+				}).then((value) => { result = value; });
 
-	assert.match(childRunId ?? "", /^child-[0-9a-f-]+$/);
-	assert.equal(launches.length, 1);
-	assert.equal(launches[0]?.childRunId, childRunId);
-	assert.equal(launches[0]?.cwd, harnessCwd);
-	assert.equal(launches[0]?.task, "Write one child-owned marker file");
-	assert.equal(launches[0]?.metadata.name, "delegate");
-	let settled = false;
-	void childSettled.then(() => {
-		settled = true;
+				try {
+					await launchEntered;
+					assert.equal(launches.length, 1);
+					assert.equal(loopEvents(harness).some((event) => (event.payload as { status?: unknown }).status === "running"), false);
+					releaseLaunch();
+					assert.equal(await Promise.race([runningWriteEntered.then(() => "running write"), delegation.then(() => "returned")]), "running write", "running must be appended before loop_delegate returns");
+					assert.equal(loopEvents(harness).some((event) => (event.payload as { status?: unknown }).status === "running"), false);
+					releaseRunningWrite();
+					await delegation;
+
+					childRunId = (result?.details as { childRunId?: string } | undefined)?.childRunId ?? "";
+					assert.match(childRunId, /^child-[0-9a-f-]+$/);
+					assert.equal(launches[0]?.childRunId, childRunId);
+					assert.equal(launches[0]?.cwd, cwd);
+					assert.equal(launches[0]?.task, "Write one child-owned marker file");
+					assert.equal(legacyDelegation?.runId, parentRunId);
+					assert.equal(legacyDelegation?.childRunId, childRunId);
+					assert.equal(runningMirrorSawDisk, true);
+					let settlementObserved = false;
+					void childSettled.then(() => { settlementObserved = true; });
+					await Promise.resolve();
+					assert.equal(settlementObserved, false, "loop_delegate must return before child settlement");
+
+					snapshotBaseline = harness.appendEntries.filter(({ customType }) => customType === "loop-state").length;
+					releaseSettlement();
+					await completedSyncEntered;
+					const beforeCompletedMirror = (await readFile(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8"))
+						.trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent);
+					assert.equal(beforeCompletedMirror.some((event) => (event.payload as { status?: unknown }).status === "completed"), true);
+					assert.equal(completedMirrors, 0);
+					assert.equal(harness.appendEntries.filter(({ customType }) => customType === "loop-state").length, snapshotBaseline);
+					releaseCompletedSync();
+					while (completedMirrors === 0 || harness.appendEntries.filter(({ customType }) => customType === "loop-state").length < snapshotBaseline + 1) {
+						await new Promise<void>((resolve) => { setImmediate(resolve); });
+					}
+					assert.equal(harness.appendEntries.filter(({ customType }) => customType === "loop-state").length, snapshotBaseline + 1);
+					assert.deepEqual(completedPublicationOrder, ["completed mirror", "loop-state"]);
+
+					const records = (await readFile(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8"))
+						.trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent);
+					const lifecycle = records.filter((event) => event.kind === "delegation.updated");
+					assert.deepEqual(lifecycle.map((event) => (event.payload as { status?: unknown }).status), ["started", "running", "completed"]);
+					assert.deepEqual(lifecycle.map((event) => event.runId), [parentRunId, parentRunId, parentRunId]);
+					const expectedPayloads = [
+						{ childId: childRunId, status: "started", artifactRefs: [] },
+						{ childId: childRunId, status: "running", artifactRefs: [] },
+						{ childId: childRunId, status: "completed", artifactRefs: [] },
+					];
+					assert.deepEqual(lifecycle.map((event) => event.payload), expectedPayloads);
+					const mirroredLifecycle = loopEvents(harness).filter((event) => event.kind === "delegation.updated");
+					assert.deepEqual(mirroredLifecycle.map((event) => event.runId), [parentRunId, parentRunId, parentRunId]);
+					assert.deepEqual(mirroredLifecycle.map((event) => event.payload), expectedPayloads);
+					assert.deepEqual(lifecycle.map((event) => event.sequence), [...lifecycle.keys()].map((index) => (lifecycle[0]?.sequence as number) + index));
+					await executeTool(harness, "loop_status", {});
+					await Promise.resolve();
+					const finalRecords = (await readFile(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8"))
+						.trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent);
+					assert.equal(finalRecords.filter((event) => event.kind === "delegation.updated"
+						&& event.runId === parentRunId
+						&& (event.payload as { childId?: unknown; status?: unknown }).childId === childRunId
+						&& (event.payload as { status?: unknown }).status === "completed").length, 1);
+					assert.equal(loopEvents(harness).filter((event) => event.kind === "delegation.updated"
+						&& event.runId === parentRunId
+						&& (event.payload as { childId?: unknown; status?: unknown }).childId === childRunId
+						&& (event.payload as { status?: unknown }).status === "completed").length, 1);
+				} finally {
+					releaseLaunch();
+					releaseRunningWrite();
+					releaseSettlement();
+					releaseCompletedSync();
+					await delegation;
+				}
+			});
+		});
 	});
-	await Promise.resolve();
-	assert.equal(settled, false, "loop_delegate must not wait for child settlement");
-	settleChild();
 });
 
 test("before_agent_start injects the latest projected decision context without raw JSONL", async () => {
