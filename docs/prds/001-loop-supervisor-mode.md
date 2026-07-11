@@ -8,9 +8,9 @@ The desired behavior is a restricted control-plane agent. When loop mode is acti
 
 ## Solution
 
-Add a loop mode that turns the main Pi agent into a restricted supervisor. The supervisor manages the objective, plan, nits, evidence, and completion checklist through loop-scoped markdown control files. It cannot inspect arbitrary project files, run shell commands, or edit implementation files. All real work is delegated to background subagents, chains, or workflows.
+Add a loop mode that turns the main Pi agent into a restricted supervisor. The supervisor manages the objective, plan, nits, decisions, and completion checklist through loop-scoped markdown control files. It receives a compact runtime projection of structured loop events as its evidence context; it does not need to inspect raw event logs. It cannot inspect arbitrary project files, run shell commands, or edit implementation files. All real work is delegated to background subagents, chains, or workflows.
 
-The loop ends only when the supervisor calls an explicit completion tool after verifying the objective requirement-by-requirement against delegated evidence, or when the loop is paused, budget-limited, or fails due to a non-recoverable error.
+The loop ends only when the supervisor calls an explicit completion tool after judging the objective requirement-by-requirement against the projected evidence, or when the loop is paused, budget-limited, or fails due to a non-recoverable error. The semantic completion decision belongs to the supervisor. Runtime code validates the integrity and current-run provenance of the supervisor's cited evidence, but does not replace that semantic judgment with a deterministic completion policy.
 
 ## User Stories
 
@@ -33,7 +33,10 @@ The loop ends only when the supervisor calls an explicit completion tool after v
 - Supervisor tools are limited to loop control, markdown control-file updates, delegation, status inspection, and completion.
 - The supervisor may write only loop-scoped markdown control artifacts. It may not write implementation files or arbitrary project files.
 - The supervisor receives an injected prompt that defines its role as orchestrator, not executor.
-- Completion requires a dedicated completion tool. The completion tool rejects empty, contradictory, or unverified completion summaries.
+- Completion requires a dedicated completion tool. The completion tool rejects empty, contradictory, structurally incomplete, or ungrounded assessments.
+- The supervisor makes the semantic decision to continue or complete after reviewing a deterministic projection of current-run facts grouped by requirement.
+- Completion validation checks that every requirement was assessed and that cited event references exist, belong to the active run, and are represented accurately; it does not decide whether the evidence is semantically sufficient.
+- Markdown control files are human-readable planning and decision artifacts, not the authoritative source for runtime evidence or terminal state.
 - The supervisor should prefer delegation over direct work whenever it needs code context, implementation, testing, review, or external task-tracker inspection.
 - The system should keep loop state independent from normal chat context where possible, while still surfacing concise status to the user.
 - If the system cannot enforce supervisor tool restrictions, loop mode must refuse to start.

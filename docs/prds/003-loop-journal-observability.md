@@ -8,7 +8,7 @@ Chat history alone is not enough. It can be compacted, become noisy, or omit low
 
 ## Solution
 
-Add a loop journal and state model that records every important loop event before surfacing it to the UI or supervisor. The journal provides an append-only event stream, a current state snapshot, and human-readable markdown summaries. The supervisor uses markdown control files for planning and decision-making, while the runtime uses structured state and event records for recovery, status, and auditing.
+Add a loop journal and state model that records every important loop event before surfacing it to the UI or supervisor. Each run has a runtime-managed JSONL event stream, a current state snapshot, and human-readable markdown summaries. A deterministic projector reduces the raw event stream into a compact supervisor decision context grouped by requirements, delegations, validations, reviews, changes, blockers, and unresolved facts. The projector answers what happened; the supervisor retains the semantic judgment of whether that evidence satisfies the objective. Markdown control files remain useful for planning and explanation, while structured events and projections drive recovery, status, provenance validation, and auditing.
 
 ## User Stories
 
@@ -26,20 +26,28 @@ Add a loop journal and state model that records every important loop event befor
 ## Implementation Decisions
 
 - Use an explicit event envelope with schema version, run identity, monotonically increasing sequence, timestamp, event kind, and payload.
-- Persist events before publishing UI updates or supervisor-visible summaries.
+- Persist each run's canonical event stream as runtime-managed JSONL with a single serialized writer; repair or reject a partial trailing record during recovery.
+- Persist events before publishing UI updates or supervisor-visible summaries, and durably synchronize settlement events before exposing terminal state.
 - Maintain both structured runtime state and human-readable markdown control summaries.
-- Separate user-editable or supervisor-editable control artifacts from runtime-managed state artifacts.
+- Separate user-editable or supervisor-editable control artifacts from runtime-managed state artifacts. The supervisor cannot directly forge runtime fact or settlement events.
 - Define event kinds for loop lifecycle, supervisor decisions, delegations, retries, guardrail violations, budget updates, nits, evidence, completion, pause, resume, and failure.
-- Provide status and result tools or commands that read the structured state rather than scraping chat output.
-- Keep full child artifacts available but return concise summaries to the supervisor to avoid context blowup.
+- Build deterministic projections from events for current state and supervisor context. Projections identify observable facts, missing data, stale references, contradictions, and unresolved blockers without deciding semantic objective completion.
+- Inject the compact projection into supervisor turns so the model evaluates relevant context rather than scanning raw JSONL or child logs.
+- Record the supervisor's requirement assessments and evidence references as events. The completion tool validates assessment shape and event provenance before appending the terminal completion event.
+- Provide status and result tools or commands that read projections and structured state rather than scraping chat output.
+- Keep full child artifacts available but return concise projected summaries to the supervisor to avoid context blowup.
 - Record token usage, duration, attempts, and result classification per delegation.
 - Preserve active loop state across reload and compaction.
 - Treat journal writes as part of the safety model: if the journal cannot be written, the loop should fail closed rather than continue invisibly.
 
 ## Testing Decisions
 
-- Tests should verify event sequence monotonicity and append-only behavior.
+- Tests should verify event sequence monotonicity, append-only behavior, JSONL replay, and partial-tail recovery.
+- Tests should verify append-before-publish and durable settlement ordering.
 - Tests should verify that each lifecycle transition writes the expected event kind.
+- Tests should verify deterministic projections for lifecycle, delegation, validation, review, blocker, and requirement-reference events.
+- Tests should verify that supervisor context is bounded and derived from projections without raw-log scanning.
+- Tests should verify that completion rejects missing, stale, cross-run, or fabricated event references while leaving semantic sufficiency to the supervisor.
 - Tests should verify that status is reconstructed from persisted state after reload.
 - Tests should verify that delegated run summaries link back to full artifacts.
 - Tests should verify that guardrail violations are recorded before being returned to the supervisor.
@@ -57,4 +65,4 @@ Add a loop journal and state model that records every important loop event befor
 
 ## Further Notes
 
-Compozy's append-before-publish journal pattern is a strong reference. For the MVP, the simplest durable event log plus state snapshot is acceptable, as long as recovery and auditability are designed from the start.
+Compozy's append-before-publish journal pattern, typed settlement events, result snapshot ordering, and deterministic read projections are the primary reference. For the MVP, per-run JSONL plus a derived state/projection snapshot is sufficient; SQLite is unnecessary until query or scale requirements justify it. Raw events answer what happened, deterministic projections organize those facts, and the supervisor decides what they mean for the objective.
