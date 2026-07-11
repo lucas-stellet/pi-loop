@@ -1995,6 +1995,101 @@ test("loop_delegate publishes the successful child lifecycle without waiting for
 	});
 });
 
+test("loop_delegate publishes exactly one first terminal outcome after duplicate and conflicting settlements", async () => {
+	const outcomes = [
+		{ status: "completed", settleFirst: (resolve: () => void, _reject: (reason?: unknown) => void) => resolve() },
+		{ status: "failed", settleFirst: (_resolve: () => void, reject: (reason?: unknown) => void) => reject(new Error("first failure")) },
+		{ status: "cancelled", settleFirst: (_resolve: () => void, reject: (reason?: unknown) => void) => reject(new DelegateCancellationError("SIGTERM")) },
+	] as const;
+
+	for (const outcome of outcomes) {
+		await withTemporaryCwd(async (cwd) => {
+			let resolveSettlement!: () => void;
+			let rejectSettlement!: (reason?: unknown) => void;
+			const settled = new Promise<void>((resolve, reject) => {
+				resolveSettlement = resolve;
+				rejectSettlement = reject;
+			});
+			const launches: Array<{ childRunId: string }> = [];
+			const unhandled: unknown[] = [];
+			const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+			const harness = createHarness({ cwd });
+			installLoop(harness, {
+				delegateExecutor: {
+					async launch(request) {
+						launches.push(request);
+						return { pid: process.pid + 1, settled };
+					},
+				},
+			});
+
+			process.on("unhandledRejection", onUnhandled);
+			try {
+				await executeTool(harness, "loop_start", { objective: `Keep ${outcome.status} first` });
+				const parentRunId = lastLoopState(harness).runId as string;
+				const delegated = await executeTool(harness, "loop_delegate", { name: "delegate", task: "Settle once" });
+				const childRunId = (delegated.details as { childRunId?: string } | undefined)?.childRunId ?? "";
+				assert.match(childRunId, /^child-[0-9a-f-]+$/);
+				assert.equal(launches.length, 1);
+				assert.equal(launches[0]?.childRunId, childRunId);
+				assert.deepEqual(loopEvents(harness).filter((event) => event.kind === "delegation.updated").map((event) => event.payload), [
+					{ childId: childRunId, status: "started", artifactRefs: [] },
+					{ childId: childRunId, status: "running", artifactRefs: [] },
+				]);
+				const snapshotBaseline = harness.appendEntries.filter((entry) => entry.customType === "loop-state").length;
+
+				outcome.settleFirst(resolveSettlement, rejectSettlement);
+				while (loopEvents(harness).filter((event) => event.kind === "delegation.updated"
+					&& event.runId === parentRunId
+					&& (event.payload as { childId?: unknown; status?: unknown }).childId === childRunId
+					&& (event.payload as { status?: unknown }).status === outcome.status).length === 0
+					|| harness.appendEntries.filter((entry) => entry.customType === "loop-state").length < snapshotBaseline + 1) {
+					await new Promise<void>((resolve) => { setImmediate(resolve); });
+				}
+
+				const terminalEntryBaseline = harness.appendEntries.length;
+				const terminalRecordBaseline = (await readFile(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8"))
+					.trimEnd().split("\n").length;
+				resolveSettlement();
+				rejectSettlement(new Error("late failure"));
+				rejectSettlement(new DelegateCancellationError("SIGTERM"));
+				await new Promise<void>((resolve) => { setImmediate(resolve); });
+				await executeTool(harness, "loop_status", {});
+				resolveSettlement();
+				rejectSettlement(new Error("later failure"));
+				await new Promise<void>((resolve) => { setImmediate(resolve); });
+
+				const records = (await readFile(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8"))
+					.trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent);
+				const canonical = records.filter((event) => event.kind === "delegation.updated" && event.runId === parentRunId
+					&& (event.payload as { childId?: unknown }).childId === childRunId);
+				const mirrored = loopEvents(harness).filter((event) => event.kind === "delegation.updated" && event.runId === parentRunId
+					&& (event.payload as { childId?: unknown }).childId === childRunId);
+				const expectedPayloads = ["started", "running", outcome.status].map((status) => ({ childId: childRunId, status, artifactRefs: [] }));
+				assert.deepEqual(canonical.map((event) => event.payload), expectedPayloads);
+				assert.deepEqual(mirrored.map((event) => event.payload), expectedPayloads);
+				assert.deepEqual(canonical.map((event) => event.runId), [parentRunId, parentRunId, parentRunId]);
+				assert.deepEqual(mirrored.map((event) => event.runId), [parentRunId, parentRunId, parentRunId]);
+				assert.deepEqual(canonical.map((event) => event.sequence), [...canonical.keys()].map((index) => (canonical[0]?.sequence as number) + index));
+				assert.deepEqual(mirrored.map((event) => event.sequence), [...mirrored.keys()].map((index) => (mirrored[0]?.sequence as number) + index));
+				assert.equal(canonical.some((event) => ["completed", "failed", "cancelled"].includes((event.payload as { status?: string }).status ?? "")
+					&& (event.payload as { status?: string }).status !== outcome.status), false);
+				assert.equal(harness.appendEntries.filter((entry) => entry.customType === "loop-state").length, snapshotBaseline + 1);
+				assert.equal(harness.appendEntries.filter((entry) => entry.customType === "loop-delegation"
+					&& (entry.data as { runId?: unknown; childRunId?: unknown }).runId === parentRunId
+					&& (entry.data as { childRunId?: unknown }).childRunId === childRunId).length, 1);
+				assert.equal(launches.length, 1);
+				assert.equal(harness.appendEntries.length, terminalEntryBaseline);
+				assert.equal(records.length, terminalRecordBaseline);
+				assert.deepEqual(unhandled, []);
+			} finally {
+				resolveSettlement();
+				process.off("unhandledRejection", onUnhandled);
+			}
+		});
+	}
+});
+
 test("loop_delegate publishes one durable runtime failed association after settlement rejection", async () => {
 	await withTemporaryCwd(async (cwd) => {
 		let rejectSettlement!: (error: Error) => void;
