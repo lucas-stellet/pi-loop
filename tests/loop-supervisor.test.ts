@@ -1995,6 +1995,124 @@ test("loop_delegate publishes the successful child lifecycle without waiting for
 	});
 });
 
+test("loop_delegate detached completed publication fails closed at each journal stage", async () => {
+	const cases = [
+		{ name: "canonical write", stage: "write" },
+		{ name: "terminal sync", stage: "sync" },
+		{ name: "loop-event mirror", stage: "mirror" },
+	] as const;
+
+	for (const row of cases) {
+		await withTemporaryCwd(async (cwd) => {
+			let resolveSettlement!: () => void;
+			const settled = new Promise<void>((resolve) => { resolveSettlement = resolve; });
+			let terminalPhase = false;
+			let completedWriteAttempts = 0;
+			let completedSyncAttempts = 0;
+			let completedSyncCompleted = false;
+			let completedMirrorAttempts = 0;
+			let signalFailureStage!: () => void;
+			const failureStageEntered = new Promise<void>((resolve) => { signalFailureStage = resolve; });
+			const injectedFailure = new Error(`completed ${row.name} failure`);
+			const unhandled: unknown[] = [];
+			const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+			const harness = createHarness({
+				cwd,
+				onAppendEntry(customType, data) {
+					const event = data as LoopEvent;
+					if (terminalPhase && customType === "loop-event" && event.kind === "delegation.updated"
+						&& (event.payload as { status?: unknown }).status === "completed") {
+						completedMirrorAttempts += 1;
+						if (row.stage === "mirror") {
+							signalFailureStage();
+							throw injectedFailure;
+						}
+					}
+				},
+			});
+			installLoop(harness, {
+				delegateExecutor: {
+					async launch() {
+						return { pid: process.pid + 1, settled };
+					},
+				},
+			});
+			const count = (type: string) => harness.appendEntries.filter((entry) => entry.customType === type).length;
+
+			await withFileHandleMethod("writeFile", (original) => async function writeFile(this: FileHandle, data: string | Uint8Array, options?: unknown) {
+				const text = typeof data === "string" ? data : Buffer.from(data).toString("utf8");
+				if (terminalPhase && text.includes('"kind":"delegation.updated"') && text.includes('"status":"completed"')) {
+					completedWriteAttempts += 1;
+					if (row.stage === "write") {
+						signalFailureStage();
+						throw injectedFailure;
+					}
+				}
+				return (original as (data: string | Uint8Array, options?: unknown) => Promise<void>).call(this, data, options);
+			}, async () => {
+				await withFileHandleMethod("sync", (original) => async function sync(this: FileHandle) {
+					if (terminalPhase && completedWriteAttempts > 0) {
+						completedSyncAttempts += 1;
+						if (row.stage === "sync") {
+							signalFailureStage();
+							throw injectedFailure;
+						}
+						await (original as () => Promise<void>).call(this);
+						completedSyncCompleted = true;
+						return;
+					}
+					return (original as () => Promise<void>).call(this);
+				}, async () => {
+					await executeTool(harness, "loop_start", { objective: `Fail closed after ${row.name}` });
+					const parentRunId = lastLoopState(harness).runId as string;
+					const delegated = await executeTool(harness, "loop_delegate", { name: "delegate", task: "settle after return" });
+					const childRunId = (delegated.details as { childRunId?: string } | undefined)?.childRunId ?? "";
+					assert.match(childRunId, /^child-[0-9a-f-]+$/);
+					const publicationBaseline = { mirrors: count("loop-event"), snapshots: count("loop-state") };
+
+					process.on("unhandledRejection", onUnhandled);
+					try {
+						terminalPhase = true;
+						resolveSettlement();
+						await failureStageEntered;
+						await new Promise<void>((resolve) => { setImmediate(resolve); });
+
+						const records = (await readFile(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8"))
+							.trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent);
+						const lifecycle = records.filter((event) => event.kind === "delegation.updated");
+						assert.deepEqual(lifecycle.map((event) => (event.payload as { status?: unknown }).status), row.stage === "write"
+							? ["started", "running"] : ["started", "running", "completed"]);
+						assert.deepEqual(lifecycle.map((event) => event.runId), lifecycle.map(() => parentRunId));
+						assert.deepEqual(lifecycle.map((event) => (event.payload as { childId?: unknown }).childId), lifecycle.map(() => childRunId));
+						assert.equal(loopEvents(harness).some((event) => event.kind === "delegation.updated"
+							&& (event.payload as { status?: unknown }).status === "completed"), false);
+						assert.deepEqual({ mirrors: count("loop-event"), snapshots: count("loop-state") }, publicationBaseline);
+						assert.equal(completedWriteAttempts, 1);
+						assert.equal(completedSyncAttempts, row.stage === "write" ? 0 : 1);
+						assert.equal(completedSyncCompleted, row.stage === "mirror");
+						assert.equal(completedMirrorAttempts, row.stage === "mirror" ? 1 : 0);
+
+						const beforeProbe = { records: records.length, mirrors: count("loop-event"), snapshots: count("loop-state") };
+						await assert.rejects(() => executeTool(harness, "loop_pause", {}), /Loop journal is unhealthy/);
+						await executeTool(harness, "loop_status", {});
+						await new Promise<void>((resolve) => { setImmediate(resolve); });
+						assert.equal(completedWriteAttempts, 1);
+						assert.equal(completedSyncAttempts, row.stage === "write" ? 0 : 1);
+						assert.equal(completedMirrorAttempts, row.stage === "mirror" ? 1 : 0);
+						assert.deepEqual({ mirrors: count("loop-event"), snapshots: count("loop-state") }, { mirrors: beforeProbe.mirrors, snapshots: beforeProbe.snapshots });
+						const afterProbe = (await readFile(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8")).trimEnd().split("\n");
+						assert.equal(afterProbe.length, beforeProbe.records);
+						assert.deepEqual(unhandled, []);
+					} finally {
+						resolveSettlement();
+						process.off("unhandledRejection", onUnhandled);
+					}
+				});
+			});
+		});
+	}
+});
+
 test("loop_delegate publishes exactly one first terminal outcome after duplicate and conflicting settlements", async () => {
 	const outcomes = [
 		{ status: "completed", settleFirst: (resolve: () => void, _reject: (reason?: unknown) => void) => resolve() },
