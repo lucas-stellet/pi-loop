@@ -1,4 +1,5 @@
 .firecrawl/
+.pi/loop/
 node_modules/
 dist/
 .DS_Store

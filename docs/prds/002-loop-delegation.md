@@ -8,7 +8,7 @@ A loop supervisor cannot complete meaningful coding objectives unless it can del
 
 Add loop-specific delegation tools that the supervisor can use to launch background subagents, chains, or generated teams. These tools are wrappers around Pi's existing subagent and chain/workflow capabilities, but they add loop-aware constraints: run association, artifact capture, timeout and retry policy, evidence requirements, and recursion limits.
 
-Delegated agents perform the actual repository reads, code edits, command execution, tests, and reviews. The supervisor receives structured summaries and evidence, updates its markdown control files, and decides the next delegation step.
+Delegated agents perform the actual repository reads, code edits, command execution, tests, and reviews. The loop runtime records child lifecycle and result facts as typed events associated with both the parent loop run and child run. A deterministic projector turns those events and full child artifacts into a concise evidence context. The supervisor uses that context to decide the next delegation step; human-readable markdown may summarize the decision but is not the authoritative evidence store.
 
 ## User Stories
 
@@ -32,6 +32,9 @@ Delegated agents perform the actual repository reads, code edits, command execut
 - Child agents should not receive loop supervisor tools by default.
 - Delegation depth must be bounded. The default should permit supervisor-to-worker delegation but prevent unbounded nested orchestration.
 - Delegation prompts must require evidence: files changed, commands run, tests run, review findings, remaining nits, confidence, and blockers.
+- The host records observable child facts as typed events, including child identity, lifecycle status, artifact references, command outcomes, changed-file scope, findings, blockers, and result classification.
+- Child prose is preserved as an artifact but does not by itself establish lifecycle or validation facts.
+- Delegation events must be consumable by the loop journal projector without requiring the supervisor to scan raw child output or JSONL.
 - Retry policy applies to failed delegations rather than to arbitrary supervisor turns.
 - Retry decisions should distinguish provider interruptions, timeouts, authentication failures, tool failures, test failures, and genuine task blockers.
 - The supervisor can use a single subagent for narrow tasks and a chain/team for multi-step or multi-context objectives.
