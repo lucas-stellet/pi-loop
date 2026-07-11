@@ -52,6 +52,11 @@ export function activeLoopState(params: {
 	};
 }
 
+/** Opaque child identity safe for use as a filesystem path segment. */
+export function createChildRunId(): string {
+	return `child-${randomUUID()}`;
+}
+
 export function lastPersistedLoopState(ctx: ExtensionContext): LoopState | undefined {
 	const sessionManager = ctx.sessionManager as unknown as { getEntries?: () => unknown[] };
 	const entries = sessionManager.getEntries?.() ?? [];

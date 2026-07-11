@@ -12,7 +12,7 @@ const SNAPSHOT_ENTRY_TYPE = "loop-state";
 const SCHEMA_VERSION = 1;
 const EVENTS_FILE = "events.jsonl";
 const UNHEALTHY_JOURNAL_ERROR = "Loop journal is unhealthy.";
-/** Lifecycle kinds that must FileHandle.sync() before session mirror / exposure. */
+/** Loop lifecycle kinds that must FileHandle.sync() before session mirror / exposure. */
 const SETTLEMENT_KINDS = new Set([
 	"loop.paused",
 	"loop.cleared",
@@ -20,6 +20,8 @@ const SETTLEMENT_KINDS = new Set([
 	"loop.failed",
 	"loop.budget_limited",
 ]);
+/** Terminal `delegation.updated` statuses that also require settlement-grade sync. */
+const TERMINAL_DELEGATION_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
 export type JournalEvent = {
 	schemaVersion: typeof SCHEMA_VERSION;
@@ -257,6 +259,15 @@ function createDiskJournal(appendEntry: AppendEntry, options: DiskOptions): Disk
 		}
 	}
 
+	function requiresSettlementSync(kind: string, payload: Record<string, unknown>): boolean {
+		return (
+			SETTLEMENT_KINDS.has(kind) ||
+			(kind === "delegation.updated" &&
+				typeof payload.status === "string" &&
+				TERMINAL_DELEGATION_STATUSES.has(payload.status))
+		);
+	}
+
 	async function appendDiskEvent(kind: string, payload: Record<string, unknown> = {}): Promise<void> {
 		if (!runId) {
 			throw new Error("Loop journal has no active run.");
@@ -271,7 +282,7 @@ function createDiskJournal(appendEntry: AppendEntry, options: DiskOptions): Disk
 			);
 			// Canonical fact first: file-level sync is the MVP durability boundary; directory fsync is out of scope.
 			await handle.writeFile(`${JSON.stringify(event)}\n`, "utf8");
-			if (SETTLEMENT_KINDS.has(kind)) {
+			if (requiresSettlementSync(kind, payload)) {
 				await handle.sync();
 			}
 			// Advance only after the durable write path succeeds; poison still leaves replay as authority.

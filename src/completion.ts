@@ -1,26 +1,38 @@
 import { LOOP_CONTROL_FILES } from "./constants.ts";
 import { readControlFile } from "./control-files.ts";
 
-type SessionEntry = {
-	type?: string;
-	customType?: string;
-	data?: unknown;
-};
-
-type DelegationData = {
-	runId?: unknown;
-	task?: unknown;
-	name?: unknown;
-	target?: unknown;
-};
-
 export type CompletionEvidenceContext = {
 	cwd: string;
 	runId?: string;
-	entries: unknown[];
 	/** Sequences known to belong to the active run's journal. */
 	knownEventSequences?: ReadonlySet<number>;
 };
+
+type JournalEvidenceEvent = {
+	runId?: string;
+	sequence: number;
+	kind: string;
+	payload: Record<string, unknown>;
+};
+
+/**
+ * Sequences that may ground completion summary/assessment evidence.
+ * Launch bookkeeping (`delegation.updated` without status `completed`) is excluded.
+ */
+export function semanticCompletionSequences(
+	events: readonly JournalEvidenceEvent[],
+	runId: string | undefined,
+): Set<number> {
+	return new Set(
+		events
+			.filter(
+				(event) =>
+					event.runId === runId &&
+					(event.kind !== "delegation.updated" || event.payload.status === "completed"),
+			)
+			.map((event) => event.sequence),
+	);
+}
 
 export type RequirementAssessmentInput = {
 	requirementId: string;
@@ -119,12 +131,11 @@ async function missingEvidence(
 	evidence: CompletionEvidenceContext,
 ): Promise<string | undefined> {
 	const sections = requirementSections(summary);
-	const delegationCitations = currentRunDelegationCitations(evidence.entries, evidence.runId);
 
 	for (let index = 0; index < requirements.length; index += 1) {
 		const requirementNumber = index + 1;
 		const section = sections.get(requirementNumber);
-		if (!section || !(await hasGroundedEvidence(section, evidence, delegationCitations))) {
+		if (!section || !(await hasGroundedEvidence(section, evidence))) {
 			return `Requirement ${requirementNumber} is missing evidence.`;
 		}
 	}
@@ -150,15 +161,7 @@ function requirementSections(summary: string): Map<number, string> {
 	return sections;
 }
 
-async function hasGroundedEvidence(
-	section: string,
-	evidence: CompletionEvidenceContext,
-	delegationCitations: string[],
-): Promise<boolean> {
-	if (delegationCitations.some((value) => section.includes(value))) {
-		return true;
-	}
-
+async function hasGroundedEvidence(section: string, evidence: CompletionEvidenceContext): Promise<boolean> {
 	// Event-sequence citations like #3 or seq:3 from the projected context.
 	if (evidence.knownEventSequences && evidence.knownEventSequences.size > 0) {
 		const cited = [...section.matchAll(/(?:#|seq:)\s*(\d+)\b/gi)].map((match) => Number(match[1]));
@@ -186,31 +189,4 @@ async function hasGroundedEvidence(
 function citesControlFile(section: string, file: string): boolean {
 	const tokens = section.match(/[A-Za-z0-9._/-]+/g) ?? [];
 	return tokens.some((token) => token.replace(/[.,;:!?]+$/, "") === file);
-}
-
-function currentRunDelegationCitations(entries: unknown[], runId: string | undefined): string[] {
-	if (!runId) {
-		return [];
-	}
-
-	const citations: string[] = [];
-	for (const candidate of entries) {
-		const entry = candidate as SessionEntry;
-		if (entry.type !== "custom" || entry.customType !== "loop-delegation") {
-			continue;
-		}
-
-		const data = entry.data as DelegationData | undefined;
-		if (data?.runId !== runId) {
-			continue;
-		}
-
-		for (const value of [data.task, data.name, data.target]) {
-			if (typeof value === "string" && value.trim().length > 0) {
-				citations.push(value);
-			}
-		}
-	}
-
-	return citations;
 }

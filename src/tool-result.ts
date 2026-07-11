@@ -2,9 +2,9 @@ import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
 
 export type ToolResult = AgentToolResult<unknown>;
 
-export function textResult(text: string): ToolResult {
+export function textResult(text: string, details?: unknown): ToolResult {
 	return {
 		content: [{ type: "text", text }],
-		details: undefined,
+		details,
 	};
 }

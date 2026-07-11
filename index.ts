@@ -4,13 +4,20 @@ import { Type } from "typebox";
 import { isSupervisorToolName, SUPERVISOR_TOOL_NAMES } from "./src/constants.ts";
 import { ControlFilePolicyError, seedControlFiles, writeControlFile } from "./src/control-files.ts";
 import {
+	semanticCompletionSequences,
 	summaryReportsFailure,
 	validateAssessmentProvenance,
 	validateCompletionSummary,
 	type RequirementAssessmentInput,
 } from "./src/completion.ts";
 import { createJournal, type JournalEvent } from "./src/journal.ts";
-import { activeLoopState, initialLoopState, lastPersistedLoopState, type LoopState } from "./src/loop-state.ts";
+import {
+	activeLoopState,
+	createChildRunId,
+	initialLoopState,
+	lastPersistedLoopState,
+	type LoopState,
+} from "./src/loop-state.ts";
 import {
 	projectRunContext,
 	type ProjectableEvent,
@@ -28,6 +35,7 @@ const LOOP_CONTINUATION_CONTENT =
 	"Continue supervising the objective: decide the next action, delegate work, and complete only with evidence.";
 
 const DECISION_CONTEXT_MAX_CHARS = 4000;
+const APPROVED_DELEGATE_NAMES = new Set(["delegate"]);
 
 type LoopEventKind =
 	| "loop.started"
@@ -356,17 +364,11 @@ export default function piLoop(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const summary = params.summary.trim();
 			const assessments = (params.assessments ?? []) as RequirementAssessmentInput[];
-			const knownEventSequences = new Set(
-				journal
-					.getEvents()
-					.filter((event) => event.runId === loopState.runId)
-					.map((event) => event.sequence),
-			);
+			const knownEventSequences = semanticCompletionSequences(journal.getEvents(), loopState.runId);
 
 			const summaryError = await validateCompletionSummary(loopState.requirements, summary, {
 				cwd: ctx.cwd,
 				runId: loopState.runId,
-				entries: ctx.sessionManager.getEntries(),
 				knownEventSequences,
 			});
 			const assessmentError =
@@ -424,25 +426,27 @@ export default function piLoop(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "loop_delegate",
 		label: "Loop Delegate",
-		description: "Record a delegation intent for loop supervisor work.",
+		description: "Start a delegated loop supervisor task.",
 		parameters: Type.Object({
-			target: Type.Optional(Type.String()),
-			name: Type.Optional(Type.String()),
+			name: Type.String(),
 			task: Type.String(),
 		}),
 		async execute(_toolCallId, params) {
-			if (!loopState.runId) {
+			if (!loopState.runId || loopState.state !== "active") {
 				throw new Error("loop_delegate requires an active loop run.");
 			}
-			const childId = params.name ?? params.target ?? "delegate";
-			pi.appendEntry("loop-delegation", { ...params, runId: loopState.runId });
+			if (!APPROVED_DELEGATE_NAMES.has(params.name)) {
+				throw new Error("loop_delegate requires an approved agent name.");
+			}
+			const childRunId = createChildRunId();
 			await appendLoopEvent("delegation.updated", {
-				childId,
-				status: "recorded",
+				childId: childRunId,
+				status: "started",
 				artifactRefs: [],
 			});
+			pi.appendEntry("loop-delegation", { ...params, runId: loopState.runId, childRunId });
 			persist();
-			return textResult("Delegation intent recorded.");
+			return textResult(`Delegation started: ${childRunId}`, { childRunId });
 		},
 	});
 

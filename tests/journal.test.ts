@@ -209,13 +209,16 @@ test("disk journal rejects a malformed complete record instead of treating it as
 });
 
 test("settlement events synchronize their record before it is mirrored", async () => {
-	const settlementKinds = [
-		"loop.paused",
-		"loop.cleared",
-		"loop.completed",
-		"loop.failed",
-		"loop.budget_limited",
-	] as const;
+	const settlementEvents: Array<{ kind: string; payload?: Record<string, string> }> = [
+		{ kind: "loop.paused" },
+		{ kind: "loop.cleared" },
+		{ kind: "loop.completed" },
+		{ kind: "loop.failed" },
+		{ kind: "loop.budget_limited" },
+		{ kind: "delegation.updated", payload: { childId: "child-1", status: "completed" } },
+		{ kind: "delegation.updated", payload: { childId: "child-1", status: "failed" } },
+		{ kind: "delegation.updated", payload: { childId: "child-1", status: "cancelled" } },
+	];
 
 	await withTemporaryCwd(async (cwd) => {
 		const order: string[] = [];
@@ -227,13 +230,13 @@ test("settlement events synchronize their record before it is mirrored", async (
 					return (original as () => Promise<void>).call(this);
 				},
 			async () => {
-				for (const kind of settlementKinds) {
+				for (const event of settlementEvents) {
 					order.length = 0;
 					const journal = createDiskJournal(() => order.push("mirror"), { cwd });
-					await journal.startRun(kind);
-					await journal.appendEvent(kind);
-					assert.ok(order.indexOf("sync") >= 0, `${kind} must synchronize its canonical record`);
-					assert.ok(order.indexOf("sync") < order.indexOf("mirror"), `${kind} must sync before mirroring`);
+					await journal.startRun(event.kind + (event.payload?.status ?? ""));
+					await journal.appendEvent(event.kind, event.payload);
+					assert.ok(order.indexOf("sync") >= 0, `${event.kind} ${event.payload?.status ?? ""} must synchronize its canonical record`);
+					assert.ok(order.indexOf("sync") < order.indexOf("mirror"), `${event.kind} must sync before mirroring`);
 				}
 			},
 		);
