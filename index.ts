@@ -23,6 +23,8 @@ import {
 	type ProjectableEvent,
 } from "./src/projection.ts";
 import { textResult } from "./src/tool-result.ts";
+import { createPiDelegateExecutor, type DelegateExecutor } from "./src/delegate-executor.ts";
+import { resolveDelegate, type DelegateResolver } from "./src/delegate-registry.ts";
 
 const SUPERVISOR_SYSTEM_PROMPT = [
 	"You are the active loop supervisor: a control-plane orchestrator, not an executor.",
@@ -35,7 +37,6 @@ const LOOP_CONTINUATION_CONTENT =
 	"Continue supervising the objective: decide the next action, delegate work, and complete only with evidence.";
 
 const DECISION_CONTEXT_MAX_CHARS = 4000;
-const APPROVED_DELEGATE_NAMES = new Set(["delegate"]);
 
 type LoopEventKind =
 	| "loop.started"
@@ -88,7 +89,12 @@ function formatLoopStatus(state: LoopState, projectedContext?: string): string {
 /**
  * Pi extension entrypoint for pi-loop.
  */
-export default function piLoop(pi: ExtensionAPI): void {
+export default function piLoop(
+	pi: ExtensionAPI,
+	dependencies: { delegateExecutor?: DelegateExecutor; delegateResolver?: DelegateResolver } = {},
+): void {
+	const delegateExecutor = dependencies.delegateExecutor ?? createPiDelegateExecutor();
+	const delegateResolver = dependencies.delegateResolver ?? resolveDelegate;
 	let loopState: LoopState = initialLoopState();
 	let preLoopTools: string[] = [];
 	let guardActive = false;
@@ -431,11 +437,12 @@ export default function piLoop(pi: ExtensionAPI): void {
 			name: Type.String(),
 			task: Type.String(),
 		}),
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!loopState.runId || loopState.state !== "active") {
 				throw new Error("loop_delegate requires an active loop run.");
 			}
-			if (!APPROVED_DELEGATE_NAMES.has(params.name)) {
+			const metadata = await delegateResolver(params.name);
+			if (!metadata) {
 				throw new Error("loop_delegate requires an approved agent name.");
 			}
 			const childRunId = createChildRunId();
@@ -446,6 +453,17 @@ export default function piLoop(pi: ExtensionAPI): void {
 			});
 			pi.appendEntry("loop-delegation", { ...params, runId: loopState.runId, childRunId });
 			persist();
+			try {
+				await delegateExecutor.launch({ childRunId, cwd: ctx.cwd, task: params.task, metadata });
+			} catch (error) {
+				await appendLoopEvent("delegation.updated", {
+					childId: childRunId,
+					status: "failed",
+					artifactRefs: [],
+				});
+				persist();
+				throw error;
+			}
 			return textResult(`Delegation started: ${childRunId}`, { childRunId });
 		},
 	});

@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 
 import { LOOP_CONTROL_FILES } from "../src/constants.ts";
+import type { DelegateExecutor } from "../src/delegate-executor.ts";
+import { resolveDelegate, type DelegateMetadata, type DelegateResolver } from "../src/delegate-registry.ts";
 import piLoop from "../index.ts";
 import { lastPersistedLoopState } from "../src/loop-state.ts";
 import { withFileHandleMethod } from "./helpers.ts";
@@ -156,6 +158,38 @@ function createHarness(options: {
 	};
 }
 
+/** Offline fixture: never spawns a real Pi child during supervisor tests. */
+function fixtureDelegateExecutor(): DelegateExecutor {
+	return {
+		async launch() {
+			return { pid: process.pid + 1, settled: Promise.resolve() };
+		},
+	};
+}
+
+/** Deterministic approved definition so supervisor tests never read ambient ~/.pi state. */
+const CONTROLLED_DELEGATE_METADATA: DelegateMetadata = Object.freeze({
+	name: "delegate",
+	tools: Object.freeze(["read", "bash"]),
+	systemPrompt: "Controlled test delegate",
+});
+
+const controlledDelegateResolver: DelegateResolver = async (name) =>
+	name === "delegate" ? CONTROLLED_DELEGATE_METADATA : undefined;
+
+function installLoop(
+	harness: ReturnType<typeof createHarness>,
+	dependencies: {
+		delegateExecutor?: DelegateExecutor;
+		delegateResolver?: DelegateResolver;
+	} = {},
+): void {
+	piLoop(harness.pi as never, {
+		delegateExecutor: dependencies.delegateExecutor ?? fixtureDelegateExecutor(),
+		delegateResolver: dependencies.delegateResolver ?? controlledDelegateResolver,
+	} as never);
+}
+
 async function executeTool(
 	harness: ReturnType<typeof createHarness>,
 	name: string,
@@ -264,14 +298,14 @@ test("state recovery preserves the real SessionManager getEntries receiver", () 
 test("registers the supervisor-only loop tool surface", () => {
 	const harness = createHarness();
 
-	piLoop(harness.pi as never);
+	installLoop(harness);
 
 	assert.deepEqual([...harness.tools.keys()].sort(), [...SUPERVISOR_TOOLS].sort());
 });
 
 test("loop_start enters active state, installs the supervisor allowlist, and runtime-blocks prohibited tools", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 
 	const startResult = await executeTool(harness, "loop_start", {
 		objective: "Implement loop supervisor mode safely",
@@ -295,7 +329,7 @@ test("loop_start enters active state, installs the supervisor allowlist, and run
 
 test("active loop tool surface contains only supervisor tools and no prohibited built-ins", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 
 	await executeTool(harness, "loop_start", { objective: "Verify restricted active tools" });
 
@@ -310,7 +344,7 @@ test("active loop tool surface contains only supervisor tools and no prohibited 
 
 test("tool_call guard blocks every prohibited built-in during active loop", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", { objective: "Block prohibited built-ins" });
 
 	const toolCallGuard = requiredHandler(harness, "tool_call", "loop mode must install a tool_call runtime guard");
@@ -322,7 +356,7 @@ test("tool_call guard blocks every prohibited built-in during active loop", asyn
 
 test("tool_call guard allows every supervisor tool during active loop", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", { objective: "Allow supervisor tools" });
 
 	const toolCallGuard = requiredHandler(harness, "tool_call", "loop mode must install a tool_call runtime guard");
@@ -338,7 +372,7 @@ test("tool_call guard allows every supervisor tool during active loop", async ()
 
 test("loop_status reports rich lifecycle details for an active loop", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 
 	await executeTool(harness, "loop_start", {
 		objective: "Ship rich lifecycle status",
@@ -357,7 +391,7 @@ test("loop_status reports rich lifecycle details for an active loop", async () =
 
 test("loop_clear removes active loop state and restores pre-loop tools", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", { objective: "Clear this loop" });
 
 	const cleared = await executeTool(harness, "loop_clear", {});
@@ -373,7 +407,7 @@ test("loop_clear removes active loop state and restores pre-loop tools", async (
 
 test("loop lifecycle transitions append ordered journal events with metadata", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 
 	await executeTool(harness, "loop_start", { objective: "Journal lifecycle", maxIterations: 2 });
 	await executeTool(harness, "loop_pause", { reason: "verify pause event" });
@@ -412,7 +446,7 @@ test("loop lifecycle transitions append ordered journal events with metadata", a
 
 test("loop_start throws instead of entering a degraded loop when tool restrictions cannot be installed", async () => {
 	const harness = createHarness({ failSetActiveTools: true });
-	piLoop(harness.pi as never);
+	installLoop(harness);
 
 	await assert.rejects(
 		() =>
@@ -441,7 +475,7 @@ test("loop_start disk failure rolls back to idle and leaves a later run restorab
 				},
 			async () => {
 				const harness = createHarness({ cwd });
-				piLoop(harness.pi as never);
+				installLoop(harness);
 				await assert.rejects(() => executeTool(harness, "loop_start", { objective: "Fail closed" }), /start disk append failed/);
 				assert.deepEqual(harness.activeTools, PRE_LOOP_TOOLS);
 				assert.equal(harness.appendEntries.some((entry) => entry.customType === "loop-state"), false);
@@ -464,7 +498,7 @@ test("loop_start disk failure rolls back to idle and leaves a later run restorab
 
 test("loop_resume throws when supervisor tool restrictions cannot be reinstalled", async () => {
 	const harness = createHarness({ failSetActiveTools: true });
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	harness.setSessionEntries([
 		persistedLoopStateEntry("paused", "Resume only with enforceable restrictions"),
 	]);
@@ -525,7 +559,7 @@ function assertGuardrailJournaled(
 test("loop_start creates its run control directory and loop_write persists every approved artifact", async () => {
 	await withTemporaryCwd(async (cwd) => {
 		const harness = createHarness({ cwd });
-		piLoop(harness.pi as never);
+		installLoop(harness);
 		await executeTool(harness, "loop_start", { objective: "Persist the control objective" });
 
 		const controlDir = activeControlDirectory(harness);
@@ -542,7 +576,7 @@ test("loop_start creates its run control directory and loop_write persists every
 test("loop_write rejects path and name policy violations without outside mutations and journals them", async () => {
 	await withTemporaryCwd(async (cwd) => {
 		const harness = createHarness({ cwd });
-		piLoop(harness.pi as never);
+		installLoop(harness);
 		await executeTool(harness, "loop_start", { objective: "Reject unsafe control paths" });
 		const outside = join(cwd, "..", "outside.txt");
 		await writeFile(outside, "unchanged", "utf8");
@@ -575,7 +609,7 @@ test("loop_write fails closed when its guardrail journal append fails", async ()
 			failAppendEntry: (customType, data) =>
 				failGuardrailAppend && customType === "loop-event" && (data as LoopEvent).kind === "loop.guardrail_violation",
 		});
-		piLoop(harness.pi as never);
+		installLoop(harness);
 		await executeTool(harness, "loop_start", { objective: "Fail closed on guardrail journal errors" });
 		failGuardrailAppend = true;
 
@@ -589,7 +623,7 @@ test("loop_write fails closed when its guardrail journal append fails", async ()
 test("loop_write refuses approved destination symlinks without changing their outside target", async () => {
 	await withTemporaryCwd(async (cwd) => {
 		const harness = createHarness({ cwd });
-		piLoop(harness.pi as never);
+		installLoop(harness);
 		await executeTool(harness, "loop_start", { objective: "Reject symlink escapes" });
 		const outside = join(cwd, "outside.md");
 		await writeFile(outside, "unchanged", "utf8");
@@ -615,7 +649,7 @@ test("loop_write refuses approved destination symlinks without changing their ou
 test("loop_write rejects hard-linked approved destinations before mutating their outside target", async () => {
 	await withTemporaryCwd(async (cwd) => {
 		const harness = createHarness({ cwd });
-		piLoop(harness.pi as never);
+		installLoop(harness);
 		await executeTool(harness, "loop_start", { objective: "Reject hard-link escapes" });
 		const outside = join(cwd, "outside.md");
 		await writeFile(outside, "unchanged", "utf8");
@@ -640,7 +674,7 @@ test("loop_write rejects hard-linked approved destinations before mutating their
 test("loop_write rejects non-regular approved destinations as unsafe", async () => {
 	await withTemporaryCwd(async (cwd) => {
 		const harness = createHarness({ cwd });
-		piLoop(harness.pi as never);
+		installLoop(harness);
 		await executeTool(harness, "loop_start", { objective: "Reject non-regular destinations" });
 		await mkdir(join(activeControlDirectory(harness), "plan.md"));
 		const entriesBefore = harness.appendEntries.length;
@@ -668,7 +702,7 @@ test("only generated loop controls are ignored", async () => {
 test("reload and compaction retain the persisted run control directory", async () => {
 	await withTemporaryCwd(async (cwd) => {
 		const harness = createHarness({ cwd });
-		piLoop(harness.pi as never);
+		installLoop(harness);
 		await executeTool(harness, "loop_start", { objective: "Keep the run directory stable" });
 		const controlDir = activeControlDirectory(harness);
 
@@ -682,7 +716,7 @@ test("reload and compaction retain the persisted run control directory", async (
 
 test("loop_complete rejects empty, contradictory, word-only, and missing evidence before accepting current-run delegation evidence", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", {
 		objective: [
 			"Implement loop supervisor mode.",
@@ -821,7 +855,7 @@ test("terminal lifecycle facts mirror only while state and supervisor restrictio
 						assert.deepEqual(JSON.parse(disk.trimEnd().split("\n").at(-1)!), event);
 					},
 				});
-				piLoop(harness.pi as never);
+				installLoop(harness);
 				await executeTool(harness, "loop_start", { objective: "Terminal fact", maxIterations: 1 });
 				await terminal.finish(harness);
 				assert.equal(observedMirror, true);
@@ -844,7 +878,7 @@ test("recovery uses JSONL high-water over stale exact-run snapshots on start and
 				[1, 2, 3].map((sequence) => JSON.stringify(persistedEvent(runId, sequence, sequence === 1 ? "loop.started" : "loop.resumed"))).join("\n") + "\n",
 			);
 			const harness = createHarness({ cwd });
-			piLoop(harness.pi as never);
+			installLoop(harness);
 			harness.setSessionEntries([{ type: "custom", customType: "loop-state", data: {
 				state: "active", objective: "Recover disk authority", requirements: [], maxIterations: 5,
 				iterationsUsed: 0, runId, sequence: 1, startedAt: 1,
@@ -864,7 +898,7 @@ test("mirror poisoning rejects later publication without snapshots or continuati
 	await withTemporaryCwd(async (cwd) => {
 		let failMirror = false;
 		const harness = createHarness({ cwd, failAppendEntry: (type) => failMirror && type === "loop-event" });
-		piLoop(harness.pi as never);
+		installLoop(harness);
 		await executeTool(harness, "loop_start", { objective: "Poison publication" });
 		failMirror = true;
 		const snapshotsBefore = harness.appendEntries.filter((entry) => entry.customType === "loop-state").length;
@@ -881,7 +915,7 @@ test("mirror poisoning rejects later publication without snapshots or continuati
 test("loop_complete accepts a cited non-empty current-run control artifact for each requirement", async () => {
 	await withTemporaryCwd(async (cwd) => {
 		const harness = createHarness({ cwd });
-		piLoop(harness.pi as never);
+		installLoop(harness);
 		await executeTool(harness, "loop_start", {
 			objective: "Requirements:\n1. Record the plan.\n2. Record the verification.",
 		});
@@ -901,7 +935,7 @@ test("loop_complete rejects delegation and artifact citations that are not safe 
 
 	await withTemporaryCwd(async (cwd) => {
 		const harness = createHarness({ cwd });
-		piLoop(harness.pi as never);
+		installLoop(harness);
 		await executeTool(harness, "loop_start", { objective: "Use only current-run evidence" });
 		await executeTool(harness, "loop_delegate", { name: "delegate", task: "prior-run delegated task" });
 		await executeTool(harness, "loop_write", { file: "evidence.md", content: "old evidence" });
@@ -917,7 +951,7 @@ test("loop_complete rejects delegation and artifact citations that are not safe 
 
 	await withTemporaryCwd(async (cwd) => {
 		const harness = createHarness({ cwd });
-		piLoop(harness.pi as never);
+		installLoop(harness);
 		await executeTool(harness, "loop_start", { objective: "Reject embedded artifact names" });
 
 		await assert.rejects(
@@ -932,7 +966,7 @@ test("loop_complete rejects delegation and artifact citations that are not safe 
 
 	await withTemporaryCwd(async (cwd) => {
 		const harness = createHarness({ cwd });
-		piLoop(harness.pi as never);
+		installLoop(harness);
 		await executeTool(harness, "loop_start", { objective: "Create an earlier run" });
 		const priorRunId = lastLoopState(harness).runId;
 		assert.equal(typeof priorRunId, "string");
@@ -953,7 +987,7 @@ test("loop_complete rejects delegation and artifact citations that are not safe 
 	for (const unsafeArtifact of ["missing", "whitespace", "symlink", "hard-link"] as const) {
 		await withTemporaryCwd(async (cwd) => {
 			const harness = createHarness({ cwd });
-			piLoop(harness.pi as never);
+			installLoop(harness);
 			await executeTool(harness, "loop_start", { objective: "Reject unsafe evidence artifacts" });
 			const evidencePath = join(activeControlDirectory(harness), "evidence.md");
 			if (unsafeArtifact === "whitespace") {
@@ -979,7 +1013,7 @@ test("loop_complete rejects delegation and artifact citations that are not safe 
 
 test("agent_end queues one custom continuation for an active loop without pending user input", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", { objective: "Continue coordinating delegated work" });
 
 	const agentEnd = requiredHandler(harness, "agent_end", "active loop mode must install an agent_end continuation hook");
@@ -998,14 +1032,14 @@ test("agent_end queues one custom continuation for an active loop without pendin
 
 test("agent_end suppresses continuation for pending input and every non-active lifecycle state", async () => {
 	const pending = createHarness({ pendingMessages: true });
-	piLoop(pending.pi as never);
+	installLoop(pending);
 	await executeTool(pending, "loop_start", { objective: "Wait for user input" });
 	await requiredHandler(pending, "agent_end", "continuation hook required")({ type: "agent_end", messages: [] }, pending.ctx);
 	assert.equal(pending.sentMessages.length, 0);
 
 	for (const state of ["paused", "complete", "budget_limited", "failed", "idle"] as const) {
 		const harness = createHarness();
-		piLoop(harness.pi as never);
+		installLoop(harness);
 		await executeTool(harness, "loop_start", { objective: "Suppress terminal continuation", maxIterations: 1 });
 		if (state === "paused") {
 			await executeTool(harness, "loop_pause", {});
@@ -1027,7 +1061,7 @@ test("agent_end suppresses continuation for pending input and every non-active l
 
 test("agent_start resets the continuation guard for exactly one next eligible agent_end", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", { objective: "Reset continuation scheduling" });
 	const agentEnd = requiredHandler(harness, "agent_end", "continuation hook required");
 	const agentStart = requiredHandler(harness, "agent_start", "iteration hook required");
@@ -1043,7 +1077,7 @@ test("agent_start resets the continuation guard for exactly one next eligible ag
 
 test("before_agent_start injects a supervisor control-plane prompt while loop mode is active", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", { objective: "Coordinate implementation through delegated workers" });
 
 	const [beforeAgentStart] = harness.handlers.get("before_agent_start") ?? [];
@@ -1063,7 +1097,7 @@ test("before_agent_start injects a supervisor control-plane prompt while loop mo
 
 test("agent_start counts automatic continuations against maxIterations without double-counting ordinary turns", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", {
 		objective: "Stop when iteration budget is exhausted",
 		maxIterations: 2,
@@ -1098,7 +1132,7 @@ test("agent_start counts automatic continuations against maxIterations without d
 
 test("loop_complete failure summaries reject, persist failed, restore tools, and permanently stop continuation", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", { objective: "Make failed loop state observable" });
 
 	await assert.rejects(
@@ -1124,7 +1158,7 @@ test("loop_complete failure summaries reject, persist failed, restore tools, and
 
 test("loop_resume leaves the paused lifecycle and tool surface intact when its disk append fails", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", { objective: "Resume transaction" });
 	await executeTool(harness, "loop_pause", {});
 	const runId = lastLoopState(harness).runId;
@@ -1144,7 +1178,7 @@ test("loop_resume leaves the paused lifecycle and tool surface intact when its d
 
 test("pause, resume, and reload recovery expose explicit loop states", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", { objective: "Persist loop state", maxIterations: 1 });
 
 	const paused = await executeTool(harness, "loop_pause", { reason: "user requested pause" });
@@ -1168,7 +1202,7 @@ test("pause, resume, and reload recovery expose explicit loop states", async () 
 
 test("active session reload reinstalls the restricted supervisor tool surface", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	harness.setSessionEntries([
 		persistedLoopStateEntry("active", "Recovered active loop"),
 	]);
@@ -1183,7 +1217,7 @@ test("active session reload reinstalls the restricted supervisor tool surface", 
 
 test("tool_call guard blocks prohibited tools after session_start recovery of active loop", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	harness.setSessionEntries([
 		persistedLoopStateEntry("active", "Recovered active loop"),
 	]);
@@ -1197,7 +1231,7 @@ test("tool_call guard blocks prohibited tools after session_start recovery of ac
 
 test("session_before_compact persists a fresh loop-state marker for non-idle loops", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", { objective: "Survive session compaction" });
 	const appendCountBeforeCompaction = harness.appendEntries.length;
 
@@ -1221,7 +1255,7 @@ test("session_before_compact persists a fresh loop-state marker for non-idle loo
 
 test("session_compact rehydrates active loop state and reinstalls supervisor restrictions", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	harness.setSessionEntries([
 		persistedLoopStateEntry("active", "Recovered after compaction"),
 	]);
@@ -1236,7 +1270,7 @@ test("session_compact rehydrates active loop state and reinstalls supervisor res
 
 test("tool_call guard blocks prohibited tools after session_compact recovery of active loop", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	harness.setSessionEntries([
 		persistedLoopStateEntry("active", "Recovered after compaction"),
 	]);
@@ -1250,7 +1284,7 @@ test("tool_call guard blocks prohibited tools after session_compact recovery of 
 
 test("loop_start cannot re-enter active loop and corrupt pre-loop tool restoration", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", { objective: "Original loop keeps original tools" });
 
 	await assert.rejects(
@@ -1265,7 +1299,7 @@ test("loop_start cannot re-enter active loop and corrupt pre-loop tool restorati
 
 test("active compaction recovery cannot corrupt pre-loop tool restoration", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", { objective: "Recover active loop without losing tools" });
 
 	const sessionCompact = requiredHandler(harness, "session_compact", "loop mode must install a session_compact recovery hook");
@@ -1283,20 +1317,504 @@ test("active compaction recovery cannot corrupt pre-loop tool restoration", asyn
 
 test("loop_delegate rejects an unknown named agent before it journals or publishes a delegation", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	let launches = 0;
+	const delegateExecutor: DelegateExecutor = {
+		async launch() {
+			launches += 1;
+			return { pid: process.pid + 1, settled: Promise.resolve() };
+		},
+	};
+	installLoop(harness, { delegateExecutor });
 	await executeTool(harness, "loop_start", { objective: "Delegate only to approved workers" });
+	const count = (customType: string) => harness.appendEntries.filter((entry) => entry.customType === customType).length;
+	const baseline = {
+		events: loopEvents(harness).filter((event) => event.kind === "delegation.updated").length,
+		delegations: count("loop-delegation"),
+		snapshots: count("loop-state"),
+	};
 
 	await assert.rejects(
 		() => executeTool(harness, "loop_delegate", { name: "../../unapproved", task: "must not run" }),
 		/approved|unknown|agent/i,
 	);
-	assert.deepEqual(loopEvents(harness).filter((event) => event.kind === "delegation.updated"), []);
-	assert.deepEqual(harness.appendEntries.filter((entry) => entry.customType === "loop-delegation"), []);
+	assert.equal(launches, 0);
+	assert.equal(loopEvents(harness).filter((event) => event.kind === "delegation.updated").length, baseline.events);
+	assert.equal(count("loop-delegation"), baseline.delegations);
+	assert.equal(count("loop-state"), baseline.snapshots);
+});
+
+test("loop_delegate validates the active loop before resolving a definition", async () => {
+	const harness = createHarness();
+	let resolutions = 0;
+	let launches = 0;
+	installLoop(harness, {
+		delegateResolver: async () => {
+			resolutions += 1;
+			return undefined;
+		},
+		delegateExecutor: {
+			async launch() {
+				launches += 1;
+				return { pid: process.pid + 1, settled: Promise.resolve() };
+			},
+		},
+	});
+	await assert.rejects(
+		() => executeTool(harness, "loop_delegate", { name: "delegate", task: "must not resolve" }),
+		/active|loop/i,
+	);
+	assert.equal(resolutions, 0);
+	assert.equal(launches, 0);
+});
+
+test("loop_delegate rejects a missing controlled definition without publication or launch", async () => {
+	const harness = createHarness();
+	let launches = 0;
+	const delegateExecutor: DelegateExecutor = {
+		async launch() {
+			launches += 1;
+			return { pid: process.pid + 1, settled: Promise.resolve() };
+		},
+	};
+	installLoop(harness, { delegateExecutor, delegateResolver: async () => undefined });
+	await executeTool(harness, "loop_start", { objective: "Reject an absent definition" });
+	const count = (customType: string) => harness.appendEntries.filter((entry) => entry.customType === customType).length;
+	const baseline = {
+		events: loopEvents(harness).filter((event) => event.kind === "delegation.updated").length,
+		delegations: count("loop-delegation"),
+		snapshots: count("loop-state"),
+	};
+
+	await assert.rejects(
+		() => executeTool(harness, "loop_delegate", { name: "delegate", task: "must not launch" }),
+		/approved|unknown|agent/i,
+	);
+	assert.equal(launches, 0);
+	assert.equal(loopEvents(harness).filter((event) => event.kind === "delegation.updated").length, baseline.events);
+	assert.equal(count("loop-delegation"), baseline.delegations);
+	assert.equal(count("loop-state"), baseline.snapshots);
+});
+
+test("loop_delegate resolves a controlled on-disk definition for its one started launch", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-loop-delegate-integration-"));
+	try {
+		await mkdir(join(root, "agents"));
+		await writeFile(
+			join(root, "agents", "delegate.md"),
+			"---\nname: delegate\ntools: read, bash\n---\nControlled on-disk prompt",
+		);
+		const harness = createHarness();
+		const launches: Array<{ metadata: DelegateMetadata }> = [];
+		installLoop(harness, {
+			delegateResolver: (name) => resolveDelegate(name, { rootResolver: () => root }),
+			delegateExecutor: {
+				async launch(request) {
+					launches.push(request);
+					return { pid: process.pid + 1, settled: Promise.resolve() };
+				},
+			},
+		});
+		await executeTool(harness, "loop_start", { objective: "Use controlled on-disk metadata" });
+		const delegated = await executeTool(harness, "loop_delegate", { name: "delegate", task: "controlled task" });
+
+		assert.equal(launches.length, 1);
+		assert.deepEqual(launches[0]?.metadata, {
+			name: "delegate",
+			tools: ["read", "bash"],
+			systemPrompt: "Controlled on-disk prompt",
+		});
+		assert.equal(Object.isFrozen(launches[0]?.metadata), true);
+		assert.equal(Object.isFrozen(launches[0]?.metadata.tools), true);
+		const details = delegated.details as { childRunId?: unknown } | undefined;
+		assert.equal(typeof details?.childRunId, "string");
+		assert.deepEqual(loopEvents(harness).filter((event) => event.kind === "delegation.updated")[0]?.payload, {
+			childId: details?.childRunId,
+			status: "started",
+			artifactRefs: [],
+		});
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("loop_delegate publishes one canonical started association before launching the child", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		const order: string[] = [];
+		let parentRunId = "";
+		let startedFromDisk: LoopEvent | undefined;
+		let startedMirror: LoopEvent | undefined;
+		let legacyDelegation: { runId?: string; childRunId?: string } | undefined;
+		let delegationSnapshot: { runId?: string; sequence?: number } | undefined;
+		let traceDelegation = false;
+		const harness = createHarness({
+			cwd,
+			onAppendEntry(customType, data) {
+				if (!traceDelegation) return;
+				if (customType === "loop-event" && (data as LoopEvent).kind === "delegation.updated") {
+					const records = readFileSync(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8")
+						.trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent);
+					startedFromDisk = records.at(-1);
+					startedMirror = data as LoopEvent;
+					order.push("canonical JSONL", "started mirror");
+				}
+				if (customType === "loop-delegation") {
+					legacyDelegation = data as { runId?: string; childRunId?: string };
+					order.push("legacy delegation");
+				}
+				if (customType === "loop-state" && order.includes("legacy delegation")) {
+					delegationSnapshot = data as { runId?: string; sequence?: number };
+					order.push("delegation snapshot");
+				}
+			},
+		});
+		let launchChildId = "";
+		installLoop(harness, { delegateExecutor: { async launch(request) {
+			launchChildId = request.childRunId;
+			order.push("launch");
+			return { pid: process.pid + 1, settled: Promise.resolve() };
+		} } });
+		await executeTool(harness, "loop_start", { objective: "Publish before launching" });
+		parentRunId = lastLoopState(harness).runId as string;
+		const count = (type: string) => harness.appendEntries.filter((entry) => entry.customType === type).length;
+		const baseline = { mirrors: count("loop-event"), legacy: count("loop-delegation"), snapshots: count("loop-state") };
+		order.length = 0;
+		startedFromDisk = undefined;
+		startedMirror = undefined;
+		legacyDelegation = undefined;
+		delegationSnapshot = undefined;
+		traceDelegation = true;
+
+		const result = await executeTool(harness, "loop_delegate", { name: "delegate", task: "Run one child" });
+		order.push("result");
+		const childRunId = (result.details as { childRunId: string }).childRunId;
+
+		assert.deepEqual({ mirrors: count("loop-event"), legacy: count("loop-delegation"), snapshots: count("loop-state") }, {
+			mirrors: baseline.mirrors + 1,
+			legacy: baseline.legacy + 1,
+			snapshots: baseline.snapshots + 1,
+		});
+		assert.deepEqual(order, ["canonical JSONL", "started mirror", "legacy delegation", "delegation snapshot", "launch", "result"]);
+		const recordedStartedFromDisk = startedFromDisk as LoopEvent | undefined;
+		const recordedStartedMirror = startedMirror as LoopEvent | undefined;
+		const recordedLegacyDelegation = legacyDelegation as { runId?: string; childRunId?: string } | undefined;
+		const recordedDelegationSnapshot = delegationSnapshot as { runId?: string; sequence?: number } | undefined;
+		for (const event of [recordedStartedFromDisk, recordedStartedMirror]) {
+			assert.equal(event?.runId, parentRunId);
+			assert.deepEqual(event?.payload, { childId: childRunId, status: "started", artifactRefs: [] });
+		}
+		assert.equal(recordedLegacyDelegation?.runId, parentRunId);
+		assert.equal(recordedLegacyDelegation?.childRunId, childRunId);
+		assert.equal(recordedDelegationSnapshot?.runId, parentRunId);
+		assert.equal(recordedDelegationSnapshot?.sequence, recordedStartedFromDisk?.sequence);
+		assert.equal(launchChildId, childRunId);
+		assert.equal((result.details as { childRunId?: string }).childRunId, childRunId);
+		assert.match(resultText(result), new RegExp(childRunId));
+	});
+});
+
+test("loop_delegate suppresses launch and later publications when its started disk append fails", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		let failStartedWrite = false;
+		await withFileHandleMethod("writeFile", (original) => async function writeFile(this: FileHandle, data: string | Uint8Array, options?: unknown) {
+			const text = typeof data === "string" ? data : Buffer.from(data).toString("utf8");
+			if (failStartedWrite && text.includes('"kind":"delegation.updated"') && text.includes('"status":"started"')) {
+				throw new Error("started disk append failed");
+			}
+			return (original as (data: string | Uint8Array, options?: unknown) => Promise<void>).call(this, data, options);
+		}, async () => {
+			const launches: unknown[] = [];
+			const harness = createHarness({ cwd });
+			installLoop(harness, { delegateExecutor: { async launch(request) {
+				launches.push(request);
+				return { pid: process.pid + 1, settled: Promise.resolve() };
+			} } });
+			await executeTool(harness, "loop_start", { objective: "Fail closed before delegation launch" });
+			const parentRunId = lastLoopState(harness).runId as string;
+			const count = (type: string) => harness.appendEntries.filter((entry) => entry.customType === type).length;
+			const baseline = { mirrors: count("loop-event"), legacy: count("loop-delegation"), snapshots: count("loop-state") };
+			failStartedWrite = true;
+
+			await assert.rejects(() => executeTool(harness, "loop_delegate", { name: "delegate", task: "must not launch" }), /started disk append failed/);
+			assert.equal(launches.length, 0);
+			assert.deepEqual({ mirrors: count("loop-event"), legacy: count("loop-delegation"), snapshots: count("loop-state") }, baseline);
+			const records = (await readFile(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent);
+			assert.equal(records.some((event) => event.kind === "delegation.updated"), false);
+			await assert.rejects(() => executeTool(harness, "loop_pause", {}), /Loop journal is unhealthy/);
+			assert.deepEqual({ mirrors: count("loop-event"), legacy: count("loop-delegation"), snapshots: count("loop-state") }, baseline);
+		});
+	});
+});
+
+test("loop_delegate suppresses launch and later publications when its started mirror fails", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		let failStartedMirror = false;
+		const launches: unknown[] = [];
+		const harness = createHarness({ cwd, onAppendEntry(customType, data) {
+			const event = data as LoopEvent;
+			if (failStartedMirror && customType === "loop-event" && event.kind === "delegation.updated" && (event.payload as { status?: string }).status === "started") {
+				throw new Error("started mirror failed");
+			}
+		} });
+		installLoop(harness, { delegateExecutor: { async launch(request) {
+			launches.push(request);
+			return { pid: process.pid + 1, settled: Promise.resolve() };
+		} } });
+		await executeTool(harness, "loop_start", { objective: "Fail closed after canonical delegation append" });
+		const parentRunId = lastLoopState(harness).runId as string;
+		const count = (type: string) => harness.appendEntries.filter((entry) => entry.customType === type).length;
+		const baseline = { mirrors: count("loop-event"), legacy: count("loop-delegation"), snapshots: count("loop-state") };
+		failStartedMirror = true;
+
+		await assert.rejects(() => executeTool(harness, "loop_delegate", { name: "delegate", task: "must not launch" }), /started mirror failed/);
+		assert.equal(launches.length, 0);
+		assert.deepEqual({ mirrors: count("loop-event"), legacy: count("loop-delegation"), snapshots: count("loop-state") }, baseline);
+		const records = (await readFile(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent);
+		const started = records.filter((event) => event.kind === "delegation.updated");
+		assert.equal(started.length, 1);
+		assert.equal(started[0]?.runId, parentRunId);
+		const retainedChildId = (started[0]?.payload as { childId?: unknown }).childId;
+		assert.equal(typeof retainedChildId, "string");
+		assert.notEqual(retainedChildId, "");
+		assert.match(retainedChildId as string, /^child-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+		assert.deepEqual(started[0]?.payload, { childId: retainedChildId, status: "started", artifactRefs: [] });
+		await assert.rejects(() => executeTool(harness, "loop_pause", {}), /Loop journal is unhealthy/);
+		assert.deepEqual({ mirrors: count("loop-event"), legacy: count("loop-delegation"), snapshots: count("loop-state") }, baseline);
+	});
+});
+
+test("loop_delegate prefers terminal journal failures over the executor rejection", async () => {
+	const cases = [
+		{ name: "canonical write", error: new Error("unique failed canonical write error"), stage: "write" },
+		{ name: "settlement sync", error: new Error("unique failed settlement sync error"), stage: "sync" },
+		{ name: "loop-event mirror", error: new Error("unique failed loop-event mirror error"), stage: "mirror" },
+	] as const;
+
+	for (const row of cases) {
+		await withTemporaryCwd(async (cwd) => {
+			const executorError = new Error(`unique executor rejection: ${row.name}`);
+			let terminalPhase = false;
+			let failedWriteAttempts = 0;
+			let failedSyncAttempts = 0;
+			let failedSyncCompleted = false;
+			let failedMirrorAttempts = 0;
+			let failureStageObserved = false;
+			let callerCaughtAfterFailure = false;
+			let executorCalls = 0;
+			let launchedChildId = "";
+			let parentRunId = "";
+			let baseline!: { mirrors: number; legacy: number; snapshots: number };
+			const harness = createHarness({
+				cwd,
+				onAppendEntry(customType, data) {
+					const event = data as LoopEvent;
+					if (terminalPhase && customType === "loop-event" && event.kind === "delegation.updated" && (event.payload as { status?: unknown }).status === "failed") {
+						failedMirrorAttempts += 1;
+						if (row.stage === "mirror") {
+							failureStageObserved = true;
+							throw row.error;
+						}
+					}
+				},
+			});
+			const count = (type: string) => harness.appendEntries.filter((entry) => entry.customType === type).length;
+			installLoop(harness, {
+				delegateExecutor: {
+					async launch(request) {
+						executorCalls += 1;
+						launchedChildId = request.childRunId;
+						baseline = { mirrors: count("loop-event"), legacy: count("loop-delegation"), snapshots: count("loop-state") };
+						terminalPhase = true;
+						throw executorError;
+					},
+				},
+			});
+
+			await withFileHandleMethod("writeFile", (original) => async function writeFile(this: FileHandle, data: string | Uint8Array, options?: unknown) {
+				const text = typeof data === "string" ? data : Buffer.from(data).toString("utf8");
+				const failedEvent = terminalPhase && text.includes('"kind":"delegation.updated"') && text.includes('"status":"failed"');
+				if (failedEvent) {
+					failedWriteAttempts += 1;
+					if (row.stage === "write") {
+						failureStageObserved = true;
+						throw row.error;
+					}
+				}
+				return (original as (data: string | Uint8Array, options?: unknown) => Promise<void>).call(this, data, options);
+			}, async () => {
+				await withFileHandleMethod("sync", (original) => async function sync(this: FileHandle) {
+					if (terminalPhase) {
+						failedSyncAttempts += 1;
+						if (row.stage === "sync") {
+							failureStageObserved = true;
+							throw row.error;
+						}
+						await (original as () => Promise<void>).call(this);
+						failedSyncCompleted = true;
+						return;
+					}
+					return (original as () => Promise<void>).call(this);
+				}, async () => {
+					await executeTool(harness, "loop_start", { objective: `Prefer ${row.name} failure` });
+					parentRunId = lastLoopState(harness).runId as string;
+					let result: ToolResult | undefined;
+					let caught: unknown;
+					await executeTool(harness, "loop_delegate", { name: "delegate", task: "reject once" }).then(
+						(value) => { result = value; },
+						(error: unknown) => {
+							caught = error;
+							callerCaughtAfterFailure = failureStageObserved;
+						},
+					);
+
+					assert.equal(caught, row.error, `${row.name} journal error must retain identity`);
+					assert.notEqual(caught, executorError);
+					assert.equal(result, undefined);
+					assert.equal(callerCaughtAfterFailure, true);
+					assert.equal(executorCalls, 1);
+					assert.equal(failedWriteAttempts, 1);
+					assert.equal(failedSyncAttempts, row.stage === "write" ? 0 : 1);
+					assert.equal(failedSyncCompleted, row.stage === "mirror");
+					assert.equal(failedMirrorAttempts, row.stage === "mirror" ? 1 : 0);
+					assert.deepEqual({ mirrors: count("loop-event"), legacy: count("loop-delegation"), snapshots: count("loop-state") }, baseline);
+
+					const records = (await readFile(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8"))
+						.trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent);
+					const lifecycle = records.filter((event) => event.kind === "delegation.updated");
+					assert.deepEqual(lifecycle.map((event) => (event.payload as { status?: unknown }).status), row.stage === "write" ? ["started"] : ["started", "failed"]);
+					assert.equal(lifecycle[0]?.runId, parentRunId);
+					assert.equal((lifecycle[0]?.payload as { childId?: unknown }).childId, launchedChildId);
+					if (row.stage !== "write") {
+						assert.equal(lifecycle[1]?.runId, parentRunId);
+						assert.deepEqual(lifecycle[1]?.payload, { childId: launchedChildId, status: "failed", artifactRefs: [] });
+						assert.equal(lifecycle[1]?.sequence, (lifecycle[0]?.sequence as number) + 1);
+					}
+					const beforeProbe = { publications: { mirrors: count("loop-event"), legacy: count("loop-delegation"), snapshots: count("loop-state") }, records: records.length };
+					await assert.rejects(() => executeTool(harness, "loop_pause", {}), /Loop journal is unhealthy/);
+					await Promise.resolve();
+					assert.equal(failedWriteAttempts, 1);
+					assert.deepEqual({ mirrors: count("loop-event"), legacy: count("loop-delegation"), snapshots: count("loop-state") }, beforeProbe.publications);
+					const afterProbe = (await readFile(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8")).trimEnd().split("\n");
+					assert.equal(afterProbe.length, beforeProbe.records);
+				});
+			});
+		});
+	}
+});
+
+test("loop_delegate publishes one durable failed association before exposing a launch rejection", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		const order: string[] = [];
+		const launchError = new Error("unique launch rejection");
+		let parentRunId = "";
+		let terminalPhase = false;
+		let releaseFailedSync!: () => void;
+		const failedSyncReleased = new Promise<void>((resolve) => {
+			releaseFailedSync = resolve;
+		});
+		let signalFailedSync!: () => void;
+		const failedSyncEntered = new Promise<void>((resolve) => {
+			signalFailedSync = resolve;
+		});
+		let failedWriteAttempts = 0;
+		let failedMirrors = 0;
+		let terminalSnapshotObserved = false;
+		const legacyDelegations: Array<{ runId?: unknown; childRunId?: unknown }> = [];
+		const harness = createHarness({
+			cwd,
+			onAppendEntry(customType, data) {
+				const event = data as LoopEvent;
+				if (customType === "loop-event" && event.kind === "delegation.updated" && (event.payload as { status?: unknown }).status === "failed") {
+					failedMirrors += 1;
+					order.push("failed loop-event mirror");
+				}
+				if (customType === "loop-state" && failedMirrors > 0 && !terminalSnapshotObserved) {
+					terminalSnapshotObserved = true;
+					order.push("failed loop-state snapshot");
+				}
+				if (customType === "loop-delegation") legacyDelegations.push(data as { runId?: unknown; childRunId?: unknown });
+			},
+		});
+		const launches: Array<{ childRunId: string }> = [];
+		installLoop(harness, {
+			delegateExecutor: {
+				async launch(request) {
+					launches.push(request);
+					terminalPhase = true;
+					throw launchError;
+				},
+			},
+		});
+
+		await withFileHandleMethod("writeFile", (original) => async function writeFile(this: FileHandle, data: string | Uint8Array, options?: unknown) {
+			const text = typeof data === "string" ? data : Buffer.from(data).toString("utf8");
+			if (terminalPhase && text.includes('"kind":"delegation.updated"') && text.includes('"status":"failed"')) failedWriteAttempts += 1;
+			return (original as (data: string | Uint8Array, options?: unknown) => Promise<void>).call(this, data, options);
+		}, async () => {
+			await withFileHandleMethod("sync", (original) => async function sync(this: FileHandle) {
+				if (terminalPhase) {
+					signalFailedSync();
+					await failedSyncReleased;
+					await (original as () => Promise<void>).call(this);
+					order.push("failed sync completion");
+					return;
+				}
+				return (original as () => Promise<void>).call(this);
+			}, async () => {
+				await executeTool(harness, "loop_start", { objective: "Durably record rejected launches" });
+				parentRunId = lastLoopState(harness).runId as string;
+				const baselineLegacy = legacyDelegations.length;
+				let caught: unknown;
+				const completion = executeTool(harness, "loop_delegate", { name: "delegate", task: "reject once" }).catch((error: unknown) => {
+					caught = error;
+					order.push("caller catch");
+				});
+
+				await failedSyncEntered;
+				try {
+					const records = (await readFile(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8"))
+						.trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent);
+					const lifecycle = records.filter((event) => event.kind === "delegation.updated");
+					assert.equal(failedWriteAttempts, 1);
+					assert.deepEqual(lifecycle.map((event) => (event.payload as { status?: unknown }).status), ["started", "failed"]);
+					assert.equal(failedMirrors, 0);
+					assert.equal(terminalSnapshotObserved, false);
+					assert.equal(caught, undefined);
+				} finally {
+					releaseFailedSync();
+				}
+				await completion;
+
+				assert.deepEqual(order, ["failed sync completion", "failed loop-event mirror", "failed loop-state snapshot", "caller catch"]);
+				assert.equal(caught, launchError);
+				assert.equal(launches.length, 1);
+				const records = (await readFile(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8"))
+					.trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent);
+				const lifecycle = records.filter((event) => event.kind === "delegation.updated");
+				assert.equal(lifecycle.length, 2);
+				const [started, failed] = lifecycle;
+				const childId = (started?.payload as { childId?: unknown }).childId;
+				assert.equal(typeof childId, "string");
+				assert.equal(started?.runId, parentRunId);
+				assert.equal(failed?.runId, parentRunId);
+				assert.deepEqual(started?.payload, { childId, status: "started", artifactRefs: [] });
+				assert.deepEqual(failed?.payload, { childId, status: "failed", artifactRefs: [] });
+				assert.equal(failed?.sequence, (started?.sequence as number) + 1);
+				assert.equal(launches[0]?.childRunId, childId);
+				const [legacyDelegation] = legacyDelegations.slice(baselineLegacy);
+				assert.equal(legacyDelegation?.runId, parentRunId);
+				assert.equal(legacyDelegation?.childRunId, childId);
+				await Promise.resolve();
+				assert.equal(failedWriteAttempts, 1);
+				assert.equal(failedMirrors, 1);
+				assert.equal(legacyDelegations.length, baselineLegacy + 1);
+			});
+		});
+	});
 });
 
 test("loop_delegate returns a child run id and journals its started association before returning", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", { objective: "Delegate one scoped task" });
 	const parentRunId = lastLoopState(harness).runId;
 	assert.equal(typeof parentRunId, "string");
@@ -1320,9 +1838,51 @@ test("loop_delegate returns a child run id and journals its started association 
 	});
 });
 
+test("loop_delegate launches the approved child and returns before it settles", async () => {
+	const harness = createHarness();
+	let settleChild!: () => void;
+	const childSettled = new Promise<void>((resolve) => {
+		settleChild = resolve;
+	});
+	const launches: Array<{
+		childRunId: string;
+		cwd: string;
+		task: string;
+		metadata: { name: string };
+	}> = [];
+	const delegateExecutor: DelegateExecutor = {
+		async launch(request) {
+			launches.push(request);
+			return { pid: process.pid + 1, settled: childSettled };
+		},
+	};
+	installLoop(harness, { delegateExecutor });
+	await executeTool(harness, "loop_start", { objective: "Launch one real delegated child" });
+
+	const delegated = await executeTool(harness, "loop_delegate", {
+		name: "delegate",
+		task: "Write one child-owned marker file",
+	});
+	const childRunId = (delegated.details as { childRunId?: string }).childRunId;
+
+	assert.match(childRunId ?? "", /^child-[0-9a-f-]+$/);
+	assert.equal(launches.length, 1);
+	assert.equal(launches[0]?.childRunId, childRunId);
+	assert.equal(launches[0]?.cwd, harnessCwd);
+	assert.equal(launches[0]?.task, "Write one child-owned marker file");
+	assert.equal(launches[0]?.metadata.name, "delegate");
+	let settled = false;
+	void childSettled.then(() => {
+		settled = true;
+	});
+	await Promise.resolve();
+	assert.equal(settled, false, "loop_delegate must not wait for child settlement");
+	settleChild();
+});
+
 test("before_agent_start injects the latest projected decision context without raw JSONL", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", {
 		objective: "Coordinate implementation through delegated workers",
 		maxIterations: 4,
@@ -1345,7 +1905,7 @@ test("before_agent_start injects the latest projected decision context without r
 
 test("loop_status consumes the same projection as supervisor decision context", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", {
 		objective: "Ship projected status",
 		maxIterations: 3,
@@ -1364,7 +1924,7 @@ test("loop_status consumes the same projection as supervisor decision context", 
 
 test("loop_complete journals assessments and rejects missing or cross-run event provenance", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", {
 		objective: ["Requirements:", "1. Record the plan.", "2. Record the verification."].join("\n"),
 	});
@@ -1415,7 +1975,7 @@ test("loop_complete journals assessments and rejects missing or cross-run event 
 
 test("summary completion rejects a started-only delegation sequence as semantic evidence", async () => {
 	const harness = createHarness();
-	piLoop(harness.pi as never);
+	installLoop(harness);
 	await executeTool(harness, "loop_start", {
 		objective: "Requirements:\n1. Ship the feature.",
 	});
