@@ -1,8 +1,9 @@
 import { constants as fsConstants } from "node:fs";
 import { lstat, mkdir, open, type FileHandle } from "node:fs/promises";
-import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { join, resolve } from "node:path";
 
 import { isLoopControlFile } from "./constants.ts";
+import { loopRunDirectory } from "./loop-paths.ts";
 
 /** Stable machine-readable policy reasons for `loop.guardrail_violation`. */
 export const CONTROL_FILE_POLICY_REASON = {
@@ -23,25 +24,6 @@ export class ControlFilePolicyError extends Error {
 	}
 }
 
-function isPathInside(parent: string, child: string): boolean {
-	const relativePath = relative(parent, child);
-	return relativePath !== "" && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath);
-}
-
-function controlDirectory(cwd: string, runId: string): string {
-	// Recovered snapshots are not schema-validated; reject path-like run identities.
-	if (!runId || isAbsolute(runId) || basename(runId) !== runId || runId.includes("\\")) {
-		throw new Error("Loop run identity cannot be used as a control directory.");
-	}
-
-	const loopDirectory = resolve(cwd, ".pi", "loop");
-	const directory = resolve(loopDirectory, runId);
-	if (!isPathInside(loopDirectory, directory)) {
-		throw new Error("Loop run identity cannot be used as a control directory.");
-	}
-	return directory;
-}
-
 async function assertRealDirectory(path: string): Promise<void> {
 	const stat = await lstat(path);
 	// lstat does not follow links, so a symlink is never reported as a directory.
@@ -51,7 +33,7 @@ async function assertRealDirectory(path: string): Promise<void> {
 }
 
 async function assertExistingControlDirectory(cwd: string, runId: string): Promise<string> {
-	const directory = controlDirectory(cwd, runId);
+	const directory = loopRunDirectory(cwd, runId);
 	for (const path of [resolve(cwd, ".pi"), resolve(cwd, ".pi", "loop"), directory]) {
 		await assertRealDirectory(path);
 	}
@@ -59,7 +41,7 @@ async function assertExistingControlDirectory(cwd: string, runId: string): Promi
 }
 
 async function ensureControlDirectory(cwd: string, runId: string): Promise<string> {
-	const directory = controlDirectory(cwd, runId);
+	const directory = loopRunDirectory(cwd, runId);
 	await mkdir(directory, { recursive: true });
 	return assertExistingControlDirectory(cwd, runId);
 }

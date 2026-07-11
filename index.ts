@@ -17,7 +17,15 @@ const SUPERVISOR_SYSTEM_PROMPT = [
 const LOOP_CONTINUATION_CONTENT =
 	"Continue supervising the objective: decide the next action, delegate work, and complete only with evidence.";
 
-type LoopEventKind = "loop.started" | "loop.paused" | "loop.resumed" | "loop.cleared" | "loop.guardrail_violation";
+type LoopEventKind =
+	| "loop.started"
+	| "loop.paused"
+	| "loop.resumed"
+	| "loop.cleared"
+	| "loop.completed"
+	| "loop.failed"
+	| "loop.budget_limited"
+	| "loop.guardrail_violation";
 
 type LoopEventPayload = Record<string, unknown>;
 
@@ -44,11 +52,16 @@ export default function piLoop(pi: ExtensionAPI): void {
 	let preLoopTools: string[] = [];
 	let guardActive = false;
 	let continuationScheduled = false;
-	const journal = createJournal((customType, data) => pi.appendEntry(customType, data));
+	// Mutable cwd so the disk journal can resolve `.pi/loop/<runId>/events.jsonl` per tool/session context.
+	let journalCwd = process.cwd();
+	// Canonical timeline is on-disk JSONL; Pi loop-event/loop-state entries are the migration mirror.
+	const journal = createJournal((customType, data) => pi.appendEntry(customType, data), { cwd: () => journalCwd });
 
-	function syncJournalRun(state: LoopState) {
+	async function syncJournalRun(state: LoopState, cwd: string) {
 		if (state.runId) {
-			journal.startRun(state.runId, state.sequence ?? 0);
+			journalCwd = cwd;
+			// Sequence comes from validated JSONL replay; companion snapshot sequence is ignored.
+			await journal.startRun(state.runId);
 		}
 	}
 
@@ -56,9 +69,14 @@ export default function piLoop(pi: ExtensionAPI): void {
 		journal.updateSnapshot(state);
 	}
 
-	function appendLoopEvent(kind: LoopEventKind, payload: LoopEventPayload = {}) {
-		journal.appendEvent(kind, payload);
-		loopState = { ...loopState, sequence: journal.getSequence() };
+	/** Append a durable journal fact, then advance in-memory sequence from the journal high-water mark. */
+	async function appendLoopEvent(
+		kind: LoopEventKind,
+		payload: LoopEventPayload = {},
+		base: LoopState = loopState,
+	) {
+		await journal.appendEvent(kind, payload);
+		loopState = { ...base, sequence: journal.getSequence() };
 	}
 
 	function installRestrictions(): string | undefined {
@@ -68,8 +86,10 @@ export default function piLoop(pi: ExtensionAPI): void {
 		}
 
 		try {
-			preLoopTools = api.getActiveTools?.() ?? preLoopTools;
+			// Snapshot tools only after setActiveTools succeeds so a failed install cannot corrupt preLoopTools.
+			const currentTools = api.getActiveTools?.() ?? preLoopTools;
 			api.setActiveTools([...SUPERVISOR_TOOL_NAMES]);
+			preLoopTools = currentTools;
 			guardActive = true;
 			return undefined;
 		} catch (error) {
@@ -82,14 +102,30 @@ export default function piLoop(pi: ExtensionAPI): void {
 		pi.setActiveTools(preLoopTools);
 	}
 
-	function recoverPersistedLoopState(ctx: ExtensionContext) {
+	/** Capture the live tool/guard surface so journal failures can roll back start/resume installs. */
+	function captureToolSurface() {
+		return {
+			activeTools: pi.getActiveTools(),
+			preLoopTools,
+			guardActive,
+		};
+	}
+
+	function restoreToolSurface(surface: ReturnType<typeof captureToolSurface>) {
+		pi.setActiveTools(surface.activeTools);
+		preLoopTools = surface.preLoopTools;
+		guardActive = surface.guardActive;
+	}
+
+	async function recoverPersistedLoopState(ctx: ExtensionContext) {
 		const recovered = lastPersistedLoopState(ctx);
 		if (!recovered) {
 			return;
 		}
 
 		loopState = recovered;
-		syncJournalRun(recovered);
+		await syncJournalRun(recovered, ctx.cwd);
+		loopState = { ...recovered, sequence: journal.getSequence() };
 		guardActive = recovered.state === "active";
 		if (guardActive) {
 			pi.setActiveTools([...SUPERVISOR_TOOL_NAMES]);
@@ -107,26 +143,30 @@ export default function piLoop(pi: ExtensionAPI): void {
 		};
 	});
 
-	pi.on("session_start", (_event, ctx) => {
-		recoverPersistedLoopState(ctx);
+	pi.on("session_start", async (_event, ctx) => {
+		await recoverPersistedLoopState(ctx);
 	});
 
-	pi.on("agent_start", () => {
+	pi.on("agent_start", async () => {
 		continuationScheduled = false;
 		if (loopState.state !== "active") {
 			return;
 		}
 
-		loopState = { ...loopState, iterationsUsed: (loopState.iterationsUsed ?? 0) + 1 };
-		if (loopState.iterationsUsed >= loopState.maxIterations) {
-			loopState = { ...loopState, state: "budget_limited" };
+		const iterationsUsed = loopState.iterationsUsed + 1;
+		if (iterationsUsed >= loopState.maxIterations) {
+			await appendLoopEvent("loop.budget_limited", { iterationsUsed });
+			loopState = { ...loopState, iterationsUsed, state: "budget_limited" };
 			restorePreLoopTools();
+			persist();
+			return;
 		}
+		loopState = { ...loopState, iterationsUsed };
 		persist();
 	});
 
 	pi.on("agent_end", (_event, ctx) => {
-		if (loopState.state !== "active") {
+		if (loopState.state !== "active" || !journal.isHealthy()) {
 			return;
 		}
 		if (ctx.hasPendingMessages() || continuationScheduled) {
@@ -158,8 +198,8 @@ export default function piLoop(pi: ExtensionAPI): void {
 		}
 	});
 
-	pi.on("session_compact", (_event, ctx) => {
-		recoverPersistedLoopState(ctx);
+	pi.on("session_compact", async (_event, ctx) => {
+		await recoverPersistedLoopState(ctx);
 	});
 
 	pi.registerTool({
@@ -182,15 +222,20 @@ export default function piLoop(pi: ExtensionAPI): void {
 			}
 			await seedControlFiles(ctx.cwd, nextLoopState.runId, params.objective);
 
+			const previousSurface = captureToolSurface();
 			const error = installRestrictions();
 			if (error) {
 				throw new Error(error);
 			}
-
-			loopState = nextLoopState;
-			syncJournalRun(loopState);
-			appendLoopEvent("loop.started", { objective: params.objective });
-			persist();
+			try {
+				// Commit active state only after durable start/init; on failure roll tools/guard back to idle surface.
+				await syncJournalRun(nextLoopState, ctx.cwd);
+				await appendLoopEvent("loop.started", { objective: params.objective }, nextLoopState);
+				persist();
+			} catch (error) {
+				restoreToolSurface(previousSurface);
+				throw error;
+			}
 			return textResult("Loop supervisor mode started.");
 		},
 	});
@@ -203,8 +248,8 @@ export default function piLoop(pi: ExtensionAPI): void {
 			reason: Type.Optional(Type.String()),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			await appendLoopEvent("loop.paused", { reason: params.reason });
 			loopState = { ...loopState, state: "paused" };
-			appendLoopEvent("loop.paused", { reason: params.reason });
 			ctx.abort();
 			restorePreLoopTools();
 			persist();
@@ -222,13 +267,22 @@ export default function piLoop(pi: ExtensionAPI): void {
 				throw new Error("loop_resume requires a paused loop state; refusing to resume.");
 			}
 
+			const previousState = loopState;
+			const previousSurface = captureToolSurface();
 			const error = installRestrictions();
 			if (error) {
 				throw new Error(error);
 			}
-			loopState = { ...loopState, state: "active" };
-			appendLoopEvent("loop.resumed");
-			persist();
+			try {
+				// Keep paused lifecycle until the resumed fact is durable; roll tools/guard back on failure.
+				await appendLoopEvent("loop.resumed");
+				loopState = { ...loopState, state: "active" };
+				persist();
+			} catch (error) {
+				loopState = previousState;
+				restoreToolSurface(previousSurface);
+				throw error;
+			}
 			return textResult("Loop supervisor mode resumed.");
 		},
 	});
@@ -249,6 +303,7 @@ export default function piLoop(pi: ExtensionAPI): void {
 			});
 			if (error) {
 				if (summaryReportsFailure(summary)) {
+					await appendLoopEvent("loop.failed", { summary });
 					loopState = { ...loopState, state: "failed" };
 					restorePreLoopTools();
 					persist();
@@ -256,6 +311,7 @@ export default function piLoop(pi: ExtensionAPI): void {
 				throw new Error(error);
 			}
 
+			await appendLoopEvent("loop.completed", { summary });
 			loopState = { ...loopState, state: "complete" };
 			restorePreLoopTools();
 			persist();
@@ -308,7 +364,7 @@ export default function piLoop(pi: ExtensionAPI): void {
 				await writeControlFile(ctx.cwd, loopState.runId, params.file, params.content);
 			} catch (error) {
 				if (error instanceof ControlFilePolicyError) {
-					appendLoopEvent("loop.guardrail_violation", {
+					await appendLoopEvent("loop.guardrail_violation", {
 						tool: "loop_write",
 						file: params.file,
 						reason: error.reason,
@@ -328,7 +384,7 @@ export default function piLoop(pi: ExtensionAPI): void {
 		description: "Clear the active loop state and restore the pre-loop tool surface.",
 		parameters: Type.Object({}),
 		async execute() {
-			appendLoopEvent("loop.cleared");
+			await appendLoopEvent("loop.cleared");
 			loopState = initialLoopState();
 			restorePreLoopTools();
 			persist();

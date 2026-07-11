@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { link, mkdir, mkdtemp, readFile, rm, symlink, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 
 import { LOOP_CONTROL_FILES } from "../src/constants.ts";
 import piLoop from "../index.ts";
+import { withFileHandleMethod } from "./helpers.ts";
 
 const SUPERVISOR_TOOLS = [
 	"loop_start",
@@ -69,6 +71,7 @@ type MockContext = {
 function createHarness(options: {
 	cwd?: string;
 	failAppendEntry?: (customType: string, data: unknown) => boolean;
+	onAppendEntry?: (customType: string, data: unknown) => void;
 	failSetActiveTools?: boolean;
 	pendingMessages?: boolean;
 } = {}) {
@@ -102,6 +105,7 @@ function createHarness(options: {
 			activeTools = [...names];
 		},
 		appendEntry(customType: string, data: unknown) {
+			options.onAppendEntry?.(customType, data);
 			if (options.failAppendEntry?.(customType, data)) {
 				throw new Error("journal unavailable");
 			}
@@ -382,6 +386,16 @@ test("loop lifecycle transitions append ordered journal events with metadata", a
 		assert.equal(typeof event.payload, "object");
 		assert.notEqual(event.payload, null);
 	}
+
+	const jsonl = await readFile(join(harness.ctx.cwd, ".pi", "loop", runId as string, "events.jsonl"), "utf8");
+	assert.deepEqual(
+		jsonl
+			.trimEnd()
+			.split("\n")
+			.map((line) => JSON.parse(line)),
+		events,
+		"the runtime JSONL log is canonical and the Pi entries are its mirror",
+	);
 });
 
 test("loop_start throws instead of entering a degraded loop when tool restrictions cannot be installed", async () => {
@@ -398,6 +412,42 @@ test("loop_start throws instead of entering a degraded loop when tool restrictio
 	assert.equal(harness.appendEntries.some((entry) => (entry.data as { state?: string })?.state === "active"), false);
 	assert.equal(harness.appendEntries.some((entry) => entry.customType === "loop-state"), false);
 	assert.equal(harness.appendEntries.some((entry) => entry.customType === "loop-event"), false);
+});
+
+test("loop_start disk failure rolls back to idle and leaves a later run restorable", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		let failStartWrite = true;
+		await withFileHandleMethod(
+			"writeFile",
+			(original) =>
+				async function writeFile(this: FileHandle, data: string | Uint8Array, options?: unknown) {
+					const text = typeof data === "string" ? data : Buffer.from(data).toString("utf8");
+					if (failStartWrite && text.includes('"kind":"loop.started"')) {
+						throw new Error("start disk append failed");
+					}
+					return (original as (data: string | Uint8Array, options?: unknown) => Promise<void>).call(this, data, options);
+				},
+			async () => {
+				const harness = createHarness({ cwd });
+				piLoop(harness.pi as never);
+				await assert.rejects(() => executeTool(harness, "loop_start", { objective: "Fail closed" }), /start disk append failed/);
+				assert.deepEqual(harness.activeTools, PRE_LOOP_TOOLS);
+				assert.equal(harness.appendEntries.some((entry) => entry.customType === "loop-state"), false);
+				assert.equal(loopEvents(harness).some((event) => event.kind === "loop.started"), false);
+				const guard = requiredHandler(harness, "tool_call", "runtime guard required");
+				assert.equal(guard({ type: "tool_call", toolCallId: "idle", toolName: "bash", input: {} }, harness.ctx), undefined);
+				await requiredHandler(harness, "agent_end", "continuation hook required")({ type: "agent_end", messages: [] }, harness.ctx);
+				assert.equal(harness.sentMessages.length, 0);
+				const status = await executeTool(harness, "loop_status", {});
+				assert.match(resultText(status), /idle/i);
+
+				failStartWrite = false;
+				await executeTool(harness, "loop_start", { objective: "Recover cleanly" });
+				await executeTool(harness, "loop_clear", {});
+				assert.deepEqual(harness.activeTools, PRE_LOOP_TOOLS);
+			},
+		);
+	});
 });
 
 test("loop_resume throws when supervisor tool restrictions cannot be reinstalled", async () => {
@@ -425,6 +475,10 @@ async function withTemporaryCwd(run: (cwd: string) => Promise<void>) {
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
+}
+
+function persistedEvent(runId: string, sequence: number, kind: string) {
+	return { schemaVersion: 1, runId, sequence, timestamp: sequence, kind, payload: {} };
 }
 
 function activeControlDirectory(harness: ReturnType<typeof createHarness>) {
@@ -691,6 +745,122 @@ test("loop_complete rejects empty, contradictory, word-only, and missing evidenc
 	assert.equal(harness.sentMessages.length, 0);
 });
 
+test("terminal lifecycle facts mirror only while state and supervisor restrictions remain pre-terminal", async () => {
+	const cases: Array<{
+		kind: "loop.completed" | "loop.failed" | "loop.budget_limited";
+		finish: (harness: ReturnType<typeof createHarness>) => Promise<void>;
+		state: "complete" | "failed" | "budget_limited";
+	}> = [
+		{
+			kind: "loop.completed",
+			state: "complete",
+			async finish(harness) {
+				await executeTool(harness, "loop_delegate", { task: "Complete the requirement" });
+				await executeTool(harness, "loop_complete", { summary: "Requirement 1: Evidence: Complete the requirement." });
+			},
+		},
+		{
+			kind: "loop.failed",
+			state: "failed",
+			async finish(harness) {
+				await assert.rejects(() => executeTool(harness, "loop_complete", { summary: "Requirement 1 failed." }));
+			},
+		},
+		{
+			kind: "loop.budget_limited",
+			state: "budget_limited",
+			async finish(harness) {
+				await requiredHandler(harness, "agent_start", "iteration handler required")({ type: "agent_start" }, harness.ctx);
+			},
+		},
+	];
+
+	for (const terminal of cases) {
+		let syncCount = 0;
+		let observedMirror = false;
+		await withFileHandleMethod(
+			"sync",
+			(original) =>
+				async function sync(this: FileHandle) {
+					syncCount += 1;
+					return (original as () => Promise<void>).call(this);
+				},
+			async () => {
+				let harness: ReturnType<typeof createHarness>;
+				harness = createHarness({
+					onAppendEntry(customType, data) {
+						if (customType !== "loop-event" || (data as LoopEvent).kind !== terminal.kind) return;
+						observedMirror = true;
+						assert.ok(syncCount > 0, "terminal record must sync before its mirror");
+						assert.equal(lastLoopState(harness).state, "active");
+						assert.deepEqual(harness.activeTools, SUPERVISOR_TOOLS);
+						const guard = requiredHandler(harness, "tool_call", "runtime guard required");
+						assert.deepEqual(guard({ type: "tool_call", toolCallId: "terminal", toolName: "bash", input: {} }, harness.ctx), {
+							block: true,
+							reason: "Loop mode: tool 'bash' is not on the supervisor allowlist.",
+						});
+						const event = data as LoopEvent;
+						const disk = readFileSync(join(harness.ctx.cwd, ".pi", "loop", event.runId as string, "events.jsonl"), "utf8");
+						assert.deepEqual(JSON.parse(disk.trimEnd().split("\n").at(-1)!), event);
+					},
+				});
+				piLoop(harness.pi as never);
+				await executeTool(harness, "loop_start", { objective: "Terminal fact", maxIterations: 1 });
+				await terminal.finish(harness);
+				assert.equal(observedMirror, true);
+				assert.equal(lastLoopState(harness).state, terminal.state);
+				assert.deepEqual(harness.activeTools, PRE_LOOP_TOOLS);
+				const diskEvents = await readFile(join(harness.ctx.cwd, ".pi", "loop", loopEvents(harness)[0]!.runId as string, "events.jsonl"), "utf8");
+				assert.deepEqual(diskEvents.trimEnd().split("\n").map((line) => JSON.parse(line)), loopEvents(harness));
+			},
+		);
+	}
+});
+
+test("recovery uses JSONL high-water over stale exact-run snapshots on start and compaction", async () => {
+	for (const eventName of ["session_start", "session_compact"] as const) {
+		await withTemporaryCwd(async (cwd) => {
+			const runId = `stale-${eventName}`;
+			await mkdir(join(cwd, ".pi", "loop", runId), { recursive: true });
+			await writeFile(
+				join(cwd, ".pi", "loop", runId, "events.jsonl"),
+				[1, 2, 3].map((sequence) => JSON.stringify(persistedEvent(runId, sequence, sequence === 1 ? "loop.started" : "loop.resumed"))).join("\n") + "\n",
+			);
+			const harness = createHarness({ cwd });
+			piLoop(harness.pi as never);
+			harness.setSessionEntries([{ type: "custom", customType: "loop-state", data: {
+				state: "active", objective: "Recover disk authority", requirements: [], maxIterations: 5,
+				iterationsUsed: 0, runId, sequence: 1, startedAt: 1,
+			} }]);
+			await requiredHandler(harness, eventName, "recovery handler required")(eventName === "session_start" ? { type: eventName } : sessionCompactEvent(), harness.ctx);
+			await assert.rejects(() => executeTool(harness, "loop_write", { file: "outside.md", content: "no" }));
+			assert.equal(lastLoopState(harness).sequence, 4);
+			assert.equal(loopEvents(harness).at(-1)?.sequence, 4);
+			const sequences = (await readFile(join(cwd, ".pi", "loop", runId, "events.jsonl"), "utf8"))
+				.trimEnd().split("\n").map((line) => JSON.parse(line).sequence);
+			assert.deepEqual(sequences, [1, 2, 3, 4]);
+		});
+	}
+});
+
+test("mirror poisoning rejects later publication without snapshots or continuation", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		let failMirror = false;
+		const harness = createHarness({ cwd, failAppendEntry: (type) => failMirror && type === "loop-event" });
+		piLoop(harness.pi as never);
+		await executeTool(harness, "loop_start", { objective: "Poison publication" });
+		failMirror = true;
+		const snapshotsBefore = harness.appendEntries.filter((entry) => entry.customType === "loop-state").length;
+		await assert.rejects(() => executeTool(harness, "loop_pause", {}), /journal unavailable/);
+		const entriesAfterPoison = harness.appendEntries.length;
+		await assert.rejects(() => executeTool(harness, "loop_clear", {}), /unhealthy|journal unavailable/);
+		assert.equal(harness.appendEntries.length, entriesAfterPoison);
+		assert.equal(harness.appendEntries.filter((entry) => entry.customType === "loop-state").length, snapshotsBefore);
+		await requiredHandler(harness, "agent_end", "continuation hook required")({ type: "agent_end", messages: [] }, harness.ctx);
+		assert.equal(harness.sentMessages.length, 0);
+	});
+});
+
 test("loop_complete accepts a cited non-empty current-run control artifact for each requirement", async () => {
 	await withTemporaryCwd(async (cwd) => {
 		const harness = createHarness({ cwd });
@@ -932,6 +1102,26 @@ test("loop_complete failure summaries reject, persist failed, restore tools, and
 	assert.equal(harness.sentMessages.length, 0);
 	const status = await executeTool(harness, "loop_status", {});
 	assert.match(resultText(status), /failed/);
+});
+
+test("loop_resume leaves the paused lifecycle and tool surface intact when its disk append fails", async () => {
+	const harness = createHarness();
+	piLoop(harness.pi as never);
+	await executeTool(harness, "loop_start", { objective: "Resume transaction" });
+	await executeTool(harness, "loop_pause", {});
+	const runId = lastLoopState(harness).runId;
+	if (typeof runId !== "string") {
+		assert.fail("paused loop must retain its run identity");
+	}
+	const eventsPath = join(harness.ctx.cwd, ".pi", "loop", runId, "events.jsonl");
+	await rm(eventsPath);
+	await mkdir(eventsPath);
+	const snapshotsBefore = harness.appendEntries.filter((entry) => entry.customType === "loop-state").length;
+
+	await assert.rejects(() => executeTool(harness, "loop_resume", {}));
+	assert.equal(lastLoopState(harness).state, "paused");
+	assert.deepEqual(harness.activeTools, PRE_LOOP_TOOLS);
+	assert.equal(harness.appendEntries.filter((entry) => entry.customType === "loop-state").length, snapshotsBefore);
 });
 
 test("pause, resume, and reload recovery expose explicit loop states", async () => {
