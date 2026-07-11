@@ -9,6 +9,7 @@ import { test } from "node:test";
 
 import {
 	createPiDelegateExecutor,
+	DelegateCancellationError,
 	type DelegateLaunchRequest,
 	type PiDelegateSpawn,
 } from "../src/delegate-executor.ts";
@@ -138,11 +139,11 @@ async function assertPreConfirmationFirstWins(options: {
 		assert.doesNotThrow(() => {
 			child.emit("error", new Error("late child error"));
 			child.stdin.emit("error", new Error("late stdin error"));
-			child.emit("close", 1);
+			child.emit("close", 1, null);
 			child.emit("spawn");
 			child.emit("error", new Error("duplicate late child error"));
 			child.stdin.emit("error", new Error("duplicate late stdin error"));
-			child.emit("close", 0);
+			child.emit("close", 0, null);
 		});
 
 		await oneTurn();
@@ -183,7 +184,7 @@ test("uses the fixed pi invocation and sends hostile caller text as exact stdin 
 	child.deliver();
 	const handle = await launching;
 	assert.equal(child.input, hostileTask);
-	child.emit("close");
+	child.emit("close", 0, null);
 	await handle.settled;
 });
 
@@ -224,7 +225,7 @@ test("waits for spawn, numeric pid, and stdin delivery, but not child close", as
 	});
 	await oneTurn();
 	assert.equal(settled, false);
-	ready.emit("close");
+	ready.emit("close", 0, null);
 	await handle.settled;
 });
 
@@ -258,15 +259,17 @@ test("rejects launch with ENOENT when the requested pi executable is missing", a
 
 test("launches a provider-free real child with a distinct live PID and reaps it", async () => {
 	let actual: ChildProcess | undefined;
+	let ready: Promise<unknown[]> | undefined;
 	let closed: Promise<unknown[]> | undefined;
 	const spawn: PiDelegateSpawn = (command, args, options) => {
 		assert.equal(command, "pi");
 		assert.deepEqual(args.slice(0, 4), ["--mode", "json", "--print", "--no-session"]);
 		assert.equal(options.shell, false);
-		actual = realSpawn(process.execPath, ["-e", "process.stdin.resume(); setInterval(() => {}, 1000)"], {
-			stdio: ["pipe", "ignore", "ignore"],
+		actual = realSpawn(process.execPath, ["-e", "process.on('SIGTERM', () => process.exit(0)); process.stdout.write('ready\\n'); process.stdin.resume(); setInterval(() => {}, 1000)"], {
+			stdio: ["pipe", "pipe", "ignore"],
 		});
-		// Install close waiter immediately so kill/close cannot race past cleanup.
+		ready = once(actual.stdout!, "data");
+		// Install close waiter immediately so close cannot race past cleanup.
 		closed = once(actual, "close");
 		return actual;
 	};
@@ -274,20 +277,47 @@ test("launches a provider-free real child with a distinct live PID and reaps it"
 	let handle: Awaited<ReturnType<typeof executor.launch>> | undefined;
 	try {
 		handle = await executor.launch(request);
+		await withTimeout(ready!, 5_000, "timed out waiting for real child readiness");
 		assert.equal(typeof handle.pid, "number");
 		assert.notEqual(handle.pid, process.pid);
 		process.kill(handle.pid, 0);
+		process.kill(handle.pid, "SIGTERM");
+		await withTimeout(closed!, 5_000, "timed out waiting to reap real child process");
+		assert.equal(actual?.exitCode, 0);
+		assert.equal(actual?.signalCode, null);
+		await handle.settled;
 	} finally {
-		if (actual && actual.exitCode === null && actual.signalCode === null) {
-			actual.kill();
-		}
-		if (closed) {
-			await withTimeout(closed, 5_000, "timed out waiting to reap real child process");
-		}
+		if (actual && actual.exitCode === null && actual.signalCode === null) actual.kill("SIGKILL");
+		if (closed) await withTimeout(closed, 5_000, "timed out waiting to reap real child process");
+		await handle?.settled.catch(() => {});
 	}
-	assert.ok(actual);
-	assert.ok(actual.exitCode !== null || actual.signalCode !== null);
-	await handle?.settled;
+});
+
+test("rejects a real signal-terminated child with the typed cancellation outcome", async () => {
+	let actual: ChildProcess | undefined;
+	let closed: Promise<unknown[]> | undefined;
+	const spawn: PiDelegateSpawn = () => {
+		actual = realSpawn(process.execPath, ["-e", "process.stdin.resume(); setInterval(() => {}, 1000)"], {
+			stdio: ["pipe", "ignore", "ignore"],
+		});
+		closed = once(actual, "close");
+		return actual;
+	};
+	const executor = createPiDelegateExecutor({ spawn });
+	let handle: Awaited<ReturnType<typeof executor.launch>> | undefined;
+	try {
+		handle = await executor.launch(request);
+		assert.notEqual(handle.pid, process.pid);
+		process.kill(handle.pid, "SIGTERM");
+		await assert.rejects(handle.settled, (error: unknown) => {
+			assert.ok(error instanceof DelegateCancellationError);
+			return true;
+		});
+	} finally {
+		if (actual && actual.exitCode === null && actual.signalCode === null) actual.kill("SIGTERM");
+		if (closed) await withTimeout(closed, 5_000, "timed out waiting to reap signal-terminated child");
+		await handle?.settled.catch(() => {});
+	}
 });
 
 test("rejects launch for pre-confirmation child, stdin, and close failures without late-event reversal", async () => {
@@ -315,7 +345,7 @@ test("rejects launch for pre-confirmation child, stdin, and close failures witho
 	await assertPreConfirmationFirstWins({
 		induce: (child) => {
 			const error = new Error("Pi child closed before launch confirmation.");
-			child.emit("close", 1);
+			child.emit("close", 1, null);
 			return error;
 		},
 		expectedEndCallsAfterFailure: 0,
@@ -359,7 +389,7 @@ test("settles once across duplicate spawn, delivery, error, and close races", as
 	child.deliver();
 	const handle = await launching;
 	child.emit("error", new Error("first failure"));
-	child.emit("close", 1);
+	child.emit("close", 1, null);
 	child.stdin.emit("error", new Error("later failure"));
 	await assert.rejects(handle.settled, /first failure/);
 });

@@ -14,6 +14,16 @@ export type DelegateLaunchHandle = Readonly<{
 	settled: Promise<void>;
 }>;
 
+export class DelegateCancellationError extends Error {
+	readonly signal: NodeJS.Signals;
+
+	constructor(signal: NodeJS.Signals) {
+		super(`Pi child cancelled by ${signal}.`);
+		this.name = "DelegateCancellationError";
+		this.signal = signal;
+	}
+}
+
 export interface DelegateExecutor {
 	launch(request: DelegateLaunchRequest): Promise<DelegateLaunchHandle>;
 }
@@ -83,12 +93,12 @@ export function createPiDelegateExecutor(options: PiDelegateExecutorOptions = {}
 				const stdin = child.stdin;
 
 				child.on("error", fail);
-				child.on("close", () => {
+				child.on("close", (_code, signal) => {
 					if (!launchDone) {
 						fail(new Error("Pi child closed before launch confirmation."));
 						return;
 					}
-					settle();
+					settle(signal === null ? undefined : new DelegateCancellationError(signal));
 				});
 
 				if (stdin === null) {

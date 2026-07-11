@@ -23,7 +23,7 @@ import {
 	type ProjectableEvent,
 } from "./src/projection.ts";
 import { textResult } from "./src/tool-result.ts";
-import { createPiDelegateExecutor, type DelegateExecutor } from "./src/delegate-executor.ts";
+import { createPiDelegateExecutor, DelegateCancellationError, type DelegateExecutor } from "./src/delegate-executor.ts";
 import { resolveDelegate, type DelegateResolver } from "./src/delegate-registry.ts";
 
 const SUPERVISOR_SYSTEM_PROMPT = [
@@ -447,7 +447,7 @@ export default function piLoop(
 				throw new Error("loop_delegate requires an approved agent name.");
 			}
 			const origin = { parentRunId, childRunId: createChildRunId() };
-			const publishLifecycle = async (status: "running" | "completed" | "failed") => {
+			const publishLifecycle = async (status: "running" | "completed" | "failed" | "cancelled") => {
 				await appendLoopEvent("delegation.updated", {
 					childId: origin.childRunId,
 					status,
@@ -467,7 +467,7 @@ export default function piLoop(
 				await publishLifecycle("running");
 				void handle.settled.then(
 					() => publishLifecycle("completed"),
-					() => publishLifecycle("failed"),
+					(error) => publishLifecycle(error instanceof DelegateCancellationError ? "cancelled" : "failed"),
 				).catch(() => undefined);
 			} catch (error) {
 				await publishLifecycle("failed");

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 
 import { LOOP_CONTROL_FILES } from "../src/constants.ts";
-import type { DelegateExecutor } from "../src/delegate-executor.ts";
+import { DelegateCancellationError, type DelegateExecutor } from "../src/delegate-executor.ts";
 import { resolveDelegate, type DelegateMetadata, type DelegateResolver } from "../src/delegate-registry.ts";
 import piLoop from "../index.ts";
 import { lastPersistedLoopState } from "../src/loop-state.ts";
@@ -2098,6 +2098,87 @@ test("loop_delegate publishes one durable runtime failed association after settl
 			});
 		} finally {
 			releaseFailedSync();
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+});
+
+test("loop_delegate publishes one durable cancelled association after typed cancellation settlement", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		let rejectSettlement!: (error: Error) => void;
+		const settled = new Promise<void>((_resolve, reject) => { rejectSettlement = reject; });
+		let releaseSync!: () => void;
+		const syncReleased = new Promise<void>((resolve) => { releaseSync = resolve; });
+		let signalSync!: () => void;
+		const syncEntered = new Promise<void>((resolve) => { signalSync = resolve; });
+		let parentRunId = "";
+		let childRunId = "";
+		let cancelledMirrors = 0;
+		let snapshotBaseline = -1;
+		const publicationOrder: string[] = [];
+		const legacyDelegations: Array<{ runId?: unknown; childRunId?: unknown }> = [];
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+		const harness = createHarness({
+			cwd,
+			onAppendEntry(customType, data) {
+				const event = data as LoopEvent;
+				const payload = event.payload as { childId?: unknown; status?: unknown } | undefined;
+				if (customType === "loop-event" && event.kind === "delegation.updated" && event.runId === parentRunId
+					&& payload?.childId === childRunId && payload.status === "cancelled") {
+					cancelledMirrors += 1;
+					publicationOrder.push("cancelled mirror");
+				}
+				if (customType === "loop-state" && snapshotBaseline >= 0) publicationOrder.push("snapshot");
+				if (customType === "loop-delegation") legacyDelegations.push(data as { runId?: unknown; childRunId?: unknown });
+			},
+		});
+		installLoop(harness, { delegateExecutor: { async launch() { return { pid: process.pid + 1, settled }; } } });
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await withFileHandleMethod("sync", (original) => async function sync(this: FileHandle) {
+				if (childRunId && cancelledMirrors === 0) {
+					signalSync();
+					await syncReleased;
+					publicationOrder.push("sync");
+				}
+				return (original as () => Promise<void>).call(this);
+			}, async () => {
+				await executeTool(harness, "loop_start", { objective: "Track one cancelled child" });
+				parentRunId = lastLoopState(harness).runId as string;
+				const delegated = await executeTool(harness, "loop_delegate", { name: "delegate", task: "Wait for cancellation" });
+				childRunId = (delegated.details as { childRunId?: string } | undefined)?.childRunId ?? "";
+				assert.match(childRunId, /^child-[0-9a-f-]+$/);
+				assert.equal(legacyDelegations.length, 1);
+				assert.equal(legacyDelegations[0]?.runId, parentRunId);
+				assert.equal(legacyDelegations[0]?.childRunId, childRunId);
+				snapshotBaseline = harness.appendEntries.filter(({ customType }) => customType === "loop-state").length;
+
+				rejectSettlement(new DelegateCancellationError("SIGTERM"));
+				await syncEntered;
+				const beforeMirror = (await readFile(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8"))
+					.trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent);
+				const canonicalLifecycle = beforeMirror.filter((event) => event.kind === "delegation.updated");
+				assert.deepEqual(canonicalLifecycle.map((event) => event.runId), [parentRunId, parentRunId, parentRunId]);
+				assert.deepEqual(canonicalLifecycle.map((event) => event.payload), [
+					{ childId: childRunId, status: "started", artifactRefs: [] },
+					{ childId: childRunId, status: "running", artifactRefs: [] },
+					{ childId: childRunId, status: "cancelled", artifactRefs: [] },
+				]);
+				assert.equal(cancelledMirrors, 0);
+				assert.equal(harness.appendEntries.filter(({ customType }) => customType === "loop-state").length, snapshotBaseline);
+				releaseSync();
+				while (cancelledMirrors === 0 || harness.appendEntries.filter(({ customType }) => customType === "loop-state").length < snapshotBaseline + 1) await new Promise<void>((resolve) => { setImmediate(resolve); });
+				assert.deepEqual(publicationOrder, ["sync", "cancelled mirror", "snapshot"]);
+				const lifecycle = loopEvents(harness).filter((event) => event.kind === "delegation.updated");
+				assert.equal(lifecycle.filter((event) => (event.payload as { status?: unknown }).status === "cancelled").length, 1);
+				assert.equal(lifecycle.some((event) => ["failed", "completed"].includes((event.payload as { status?: string }).status ?? "")), false);
+				assert.equal(legacyDelegations.length, 1);
+				await new Promise<void>((resolve) => { setImmediate(resolve); });
+				assert.deepEqual(unhandled, []);
+			});
+		} finally {
+			releaseSync();
 			process.off("unhandledRejection", onUnhandled);
 		}
 	});
