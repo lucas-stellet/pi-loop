@@ -7,6 +7,7 @@ import { after, before, test } from "node:test";
 
 import { LOOP_CONTROL_FILES } from "../src/constants.ts";
 import piLoop from "../index.ts";
+import { lastPersistedLoopState } from "../src/loop-state.ts";
 import { withFileHandleMethod } from "./helpers.ts";
 
 const SUPERVISOR_TOOLS = [
@@ -248,6 +249,17 @@ async function assertLoopGuardBlocksTool(
 		reason: `Loop mode: tool '${toolName}' is not on the supervisor allowlist.`,
 	});
 }
+
+test("state recovery preserves the real SessionManager getEntries receiver", () => {
+	const sessionManager = {
+		fileEntries: [persistedLoopStateEntry("active", "Receiver-sensitive recovery")],
+		getEntries() {
+			return this.fileEntries;
+		},
+	};
+	const recovered = lastPersistedLoopState({ sessionManager } as never);
+	assert.equal(recovered?.objective, "Receiver-sensitive recovery");
+});
 
 test("registers the supervisor-only loop tool surface", () => {
 	const harness = createHarness();

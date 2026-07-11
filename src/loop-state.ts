@@ -53,8 +53,8 @@ export function activeLoopState(params: {
 }
 
 export function lastPersistedLoopState(ctx: ExtensionContext): LoopState | undefined {
-	const getEntries = (ctx.sessionManager as unknown as { getEntries?: () => unknown[] }).getEntries;
-	const entries = getEntries?.() ?? [];
+	const sessionManager = ctx.sessionManager as unknown as { getEntries?: () => unknown[] };
+	const entries = sessionManager.getEntries?.() ?? [];
 	for (let index = entries.length - 1; index >= 0; index -= 1) {
 		const entry = entries[index] as SessionEntry;
 		if (entry.type === "custom" && entry.customType === "loop-state") {
