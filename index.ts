@@ -10,7 +10,7 @@ import {
 	validateCompletionSummary,
 	type RequirementAssessmentInput,
 } from "./src/completion.ts";
-import { createJournal, type JournalEvent } from "./src/journal.ts";
+import { createJournal, type DiskJournal, type JournalEvent } from "./src/journal.ts";
 import {
 	activeLoopState,
 	createChildRunId,
@@ -99,31 +99,71 @@ export default function piLoop(
 	let preLoopTools: string[] = [];
 	let guardActive = false;
 	let continuationScheduled = false;
-	// Mutable cwd so the disk journal can resolve `.pi/loop/<runId>/events.jsonl` per tool/session context.
-	let journalCwd = process.cwd();
-	// Canonical timeline is on-disk JSONL; Pi loop-event/loop-state entries are the migration mirror.
-	const journal = createJournal((customType, data) => pi.appendEntry(customType, data), { cwd: () => journalCwd });
+	// One fixed-cwd DiskJournal per run for the extension lifetime; late settlements retain their origin channel.
+	type RunChannel = { runId: string; cwd: string; journal: DiskJournal };
+	const channels = new Map<string, RunChannel>();
+	let currentChannel: RunChannel | undefined;
+
+	function currentJournal(): DiskJournal {
+		if (!currentChannel) {
+			throw new Error("Loop journal has no active run.");
+		}
+		return currentChannel.journal;
+	}
 
 	async function syncJournalRun(state: LoopState, cwd: string) {
-		if (state.runId) {
-			journalCwd = cwd;
+		if (!state.runId) {
+			return;
+		}
+		let channel = channels.get(state.runId);
+		if (channel) {
+			if (channel.cwd !== cwd) {
+				throw new Error("Loop run journal cwd does not match its originating run.");
+			}
+		} else {
+			channel = {
+				runId: state.runId,
+				cwd,
+				journal: createJournal((customType, data) => pi.appendEntry(customType, data), { cwd }),
+			};
+			channels.set(state.runId, channel);
+		}
+		const previousChannel = currentChannel;
+		currentChannel = channel;
+		try {
 			// Sequence comes from validated JSONL replay; companion snapshot sequence is ignored.
-			await journal.startRun(state.runId);
+			await channel.journal.startRun(state.runId);
+		} catch (error) {
+			if (currentChannel === channel) {
+				currentChannel = previousChannel;
+			}
+			throw error;
 		}
 	}
 
 	function persist(state = loopState) {
-		journal.updateSnapshot(state);
+		currentJournal().updateSnapshot(state);
 	}
 
-	/** Append a durable journal fact, then advance in-memory sequence from the journal high-water mark. */
+	/** Append a durable journal fact, then advance current in-memory state from the channel high-water mark. */
 	async function appendLoopEvent(
 		kind: LoopEventKind,
 		payload: LoopEventPayload = {},
 		base: LoopState = loopState,
+		channel = currentChannel,
 	) {
-		await journal.appendEvent(kind, payload);
-		loopState = { ...base, sequence: journal.getSequence() };
+		if (!channel) {
+			throw new Error("Loop journal has no active run.");
+		}
+		await channel.journal.appendEvent(kind, payload);
+		// Re-check after await: clear/start may have switched the active run while this append was in flight.
+		// base.runId covers loop_start, which commits the new run through `base` while loopState is still idle.
+		if (
+			currentChannel === channel
+			&& (loopState.runId === channel.runId || base.runId === channel.runId)
+		) {
+			loopState = { ...base, sequence: channel.journal.getSequence() };
+		}
 	}
 
 	function installRestrictions(): string | undefined {
@@ -172,7 +212,7 @@ export default function piLoop(
 
 		loopState = recovered;
 		await syncJournalRun(recovered, ctx.cwd);
-		loopState = { ...recovered, sequence: journal.getSequence() };
+		loopState = { ...recovered, sequence: recovered.runId ? currentJournal().getSequence() : 0 };
 		guardActive = recovered.state === "active";
 		if (guardActive) {
 			pi.setActiveTools([...SUPERVISOR_TOOL_NAMES]);
@@ -214,7 +254,7 @@ export default function piLoop(
 	});
 
 	pi.on("agent_end", (_event, ctx) => {
-		if (loopState.state !== "active" || !journal.isHealthy()) {
+		if (loopState.state !== "active" || !currentJournal().isHealthy()) {
 			return;
 		}
 		if (ctx.hasPendingMessages() || continuationScheduled) {
@@ -239,7 +279,7 @@ export default function piLoop(
 
 		const { context } = projectRunContext({
 			runId: loopState.runId,
-			events: toProjectableEvents(journal.getEvents()),
+			events: toProjectableEvents(currentJournal().getEvents()),
 			maxCharacters: DECISION_CONTEXT_MAX_CHARS,
 		});
 		return {
@@ -370,7 +410,7 @@ export default function piLoop(
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const summary = params.summary.trim();
 			const assessments = (params.assessments ?? []) as RequirementAssessmentInput[];
-			const knownEventSequences = semanticCompletionSequences(journal.getEvents(), loopState.runId);
+			const knownEventSequences = semanticCompletionSequences(currentJournal().getEvents(), loopState.runId);
 
 			const summaryError = await validateCompletionSummary(loopState.requirements, summary, {
 				cwd: ctx.cwd,
@@ -422,7 +462,7 @@ export default function piLoop(
 			}
 			const { context } = projectRunContext({
 				runId: loopState.runId,
-				events: toProjectableEvents(journal.getEvents()),
+				events: toProjectableEvents(currentJournal().getEvents()),
 				maxCharacters: DECISION_CONTEXT_MAX_CHARS,
 			});
 			return textResult(formatLoopStatus(loopState, context));
@@ -442,26 +482,35 @@ export default function piLoop(
 				throw new Error("loop_delegate requires an active loop run.");
 			}
 			const parentRunId = loopState.runId;
+			const originChannel = currentChannel;
+			if (!originChannel) {
+				throw new Error("Loop journal has no active run.");
+			}
 			const metadata = await delegateResolver(params.name);
 			if (!metadata) {
 				throw new Error("loop_delegate requires an approved agent name.");
 			}
 			const origin = { parentRunId, childRunId: createChildRunId() };
+			const persistIfCurrent = () => {
+				if (currentChannel === originChannel && loopState.runId === originChannel.runId) {
+					persist();
+				}
+			};
 			const publishLifecycle = async (status: "running" | "completed" | "failed" | "cancelled") => {
 				await appendLoopEvent("delegation.updated", {
 					childId: origin.childRunId,
 					status,
 					artifactRefs: [],
-				});
-				persist();
+				}, loopState, originChannel);
+				persistIfCurrent();
 			};
 			await appendLoopEvent("delegation.updated", {
 				childId: origin.childRunId,
 				status: "started",
 				artifactRefs: [],
-			});
+			}, loopState, originChannel);
 			pi.appendEntry("loop-delegation", { ...params, runId: origin.parentRunId, childRunId: origin.childRunId });
-			persist();
+			persistIfCurrent();
 			try {
 				const handle = await delegateExecutor.launch({ childRunId: origin.childRunId, cwd: ctx.cwd, task: params.task, metadata });
 				await publishLifecycle("running");
@@ -518,6 +567,7 @@ export default function piLoop(
 			loopState = initialLoopState();
 			restorePreLoopTools();
 			persist();
+			currentChannel = undefined;
 			return textResult("Loop state cleared; idle state restored.");
 		},
 	});

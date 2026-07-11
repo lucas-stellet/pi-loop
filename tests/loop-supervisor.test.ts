@@ -2090,6 +2090,100 @@ test("loop_delegate publishes exactly one first terminal outcome after duplicate
 	}
 });
 
+test("clear/restart callback isolation retains late delegated terminals with their originating run", async () => {
+	const outcomes = [
+		{ status: "completed", settle: (resolve: () => void, _reject: (reason?: unknown) => void) => resolve() },
+		{ status: "failed", settle: (_resolve: () => void, reject: (reason?: unknown) => void) => reject(new Error("late failure")) },
+		{ status: "cancelled", settle: (_resolve: () => void, reject: (reason?: unknown) => void) => reject(new DelegateCancellationError("SIGTERM")) },
+	] as const;
+
+	for (const outcome of outcomes) {
+		await withTemporaryCwd(async (cwd) => {
+			let resolveSettlement!: () => void;
+			let rejectSettlement!: (reason?: unknown) => void;
+			const settled = new Promise<void>((resolve, reject) => {
+				resolveSettlement = resolve;
+				rejectSettlement = reject;
+			});
+			let aTerminalMirrors = 0;
+			const unhandled: unknown[] = [];
+			const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+			const harness = createHarness({
+				cwd,
+				onAppendEntry(customType, data) {
+					const event = data as LoopEvent;
+					if (customType === "loop-event" && event.kind === "delegation.updated"
+						&& (event.payload as { status?: unknown }).status === outcome.status) aTerminalMirrors += 1;
+				},
+			});
+			installLoop(harness, {
+				delegateExecutor: {
+					async launch() {
+						return { pid: process.pid + 1, settled };
+					},
+				},
+			});
+			process.on("unhandledRejection", onUnhandled);
+			try {
+				await executeTool(harness, "loop_start", { objective: `Keep late ${outcome.status} isolated`, maxIterations: 3 });
+				const runA = lastLoopState(harness).runId as string;
+				const delegated = await executeTool(harness, "loop_delegate", { name: "delegate", task: "Settle after restart" });
+				const childId = (delegated.details as { childRunId?: string } | undefined)?.childRunId ?? "";
+				assert.match(childId, /^child-[0-9a-f-]+$/);
+				const beforeClear = (await readFile(join(cwd, ".pi", "loop", runA, "events.jsonl"), "utf8"))
+					.trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent)
+					.filter((event) => event.kind === "delegation.updated");
+				assert.deepEqual(beforeClear.map((event) => (event.payload as { status?: unknown }).status), ["started", "running"]);
+
+				await executeTool(harness, "loop_clear", {});
+				await executeTool(harness, "loop_start", { objective: "Run B stays current", maxIterations: 3 });
+				const runB = lastLoopState(harness).runId as string;
+				assert.notEqual(runB, runA);
+				const snapshotsBeforePublications = harness.appendEntries.filter((entry) => entry.customType === "loop-state").length;
+
+				outcome.settle(resolveSettlement, rejectSettlement);
+				await requiredHandler(harness, "agent_start", "B iteration hook required")({ type: "agent_start" }, harness.ctx);
+				while (aTerminalMirrors === 0) await new Promise<void>((resolve) => { setImmediate(resolve); });
+
+				const readEvents = async (runId: string) => (await readFile(join(cwd, ".pi", "loop", runId, "events.jsonl"), "utf8"))
+					.trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent);
+				const aEvents = await readEvents(runA);
+				const bEvents = await readEvents(runB);
+				const aLifecycle = aEvents.filter((event) => event.kind === "delegation.updated");
+				assert.deepEqual(aLifecycle.map((event) => (event.payload as { status?: unknown }).status), ["started", "running", outcome.status]);
+				assert.deepEqual(aLifecycle.map((event) => event.runId), [runA, runA, runA]);
+				assert.deepEqual(aLifecycle.map((event) => (event.payload as { childId?: unknown }).childId), [childId, childId, childId]);
+				assert.deepEqual(aEvents.map((event) => event.sequence), aEvents.map((_event, index) => index + 1));
+				assert.equal(bEvents.some((event) => JSON.stringify(event).includes(childId)), false);
+				assert.ok(bEvents.some((event) => event.kind === "loop.iteration"));
+				assert.deepEqual(bEvents.map((event) => event.sequence), bEvents.map((_event, index) => index + 1));
+
+				const mirrors = loopEvents(harness);
+				assert.equal(mirrors.filter((event) => event.runId === runA
+					&& (event.payload as { childId?: unknown; status?: unknown }).childId === childId
+					&& (event.payload as { status?: unknown }).status === outcome.status).length, 1);
+				assert.equal(mirrors.some((event) => event.runId === runB && JSON.stringify(event).includes(childId)), false);
+				assert.equal(harness.appendEntries.filter((entry) => entry.customType === "loop-state").length, snapshotsBeforePublications + 1);
+				assert.equal(lastLoopState(harness).runId, runB);
+
+				const status = await executeTool(harness, "loop_status", {});
+				assert.doesNotMatch(resultText(status), new RegExp(childId));
+				const prompt = await requiredHandler(harness, "before_agent_start", "prompt hook required")({ type: "before_agent_start" }, harness.ctx);
+				assert.doesNotMatch(prompt.systemPrompt, new RegExp(childId));
+				await requiredHandler(harness, "session_compact", "recovery hook required")(sessionCompactEvent(), harness.ctx);
+				assert.equal(lastLoopState(harness).runId, runB);
+				await requiredHandler(harness, "agent_start", "B iteration hook required")({ type: "agent_start" }, harness.ctx);
+				assert.deepEqual((await readEvents(runB)).map((event) => event.sequence), bEvents.concat({}).map((_event, index) => index + 1));
+				await new Promise<void>((resolve) => { setImmediate(resolve); });
+				assert.deepEqual(unhandled, []);
+			} finally {
+				resolveSettlement();
+				process.off("unhandledRejection", onUnhandled);
+			}
+		});
+	}
+});
+
 test("loop_delegate publishes one durable runtime failed association after settlement rejection", async () => {
 	await withTemporaryCwd(async (cwd) => {
 		let rejectSettlement!: (error: Error) => void;
