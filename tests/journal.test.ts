@@ -167,6 +167,30 @@ test("disk journal replays a valid log and safely removes only a partial trailin
 	});
 });
 
+test("journal exposes a defensive validated event snapshot with append and replay parity", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		const journal = createDiskJournal(createHarness().appendEntry, { cwd });
+		await journal.startRun("run-1");
+		await journal.appendEvent("loop.started", { maxIterations: 2 });
+		await journal.appendEvent("loop.iteration", { used: 1 });
+
+		const appended = journal.getEvents();
+		assert.deepEqual(
+			appended.map(({ sequence, kind, payload }) => ({ sequence, kind, payload })),
+			[
+				{ sequence: 1, kind: "loop.started", payload: { maxIterations: 2 } },
+				{ sequence: 2, kind: "loop.iteration", payload: { used: 1 } },
+			],
+		);
+		appended[0]!.payload.maxIterations = 99;
+		assert.equal(journal.getEvents()[0]!.payload.maxIterations, 2, "callers cannot mutate journal authority");
+
+		const recovered = createDiskJournal(createHarness().appendEntry, { cwd });
+		await recovered.startRun("run-1");
+		assert.deepEqual(recovered.getEvents(), journal.getEvents(), "replay exposes the same validated stream as append");
+	});
+});
+
 test("disk journal rejects a malformed complete record instead of treating it as replayed state", async () => {
 	await withTemporaryCwd(async (cwd) => {
 		await mkdir(join(cwd, ".pi", "loop", "run-1"), { recursive: true });

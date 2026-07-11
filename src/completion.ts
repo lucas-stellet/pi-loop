@@ -18,6 +18,14 @@ export type CompletionEvidenceContext = {
 	cwd: string;
 	runId?: string;
 	entries: unknown[];
+	/** Sequences known to belong to the active run's journal. */
+	knownEventSequences?: ReadonlySet<number>;
+};
+
+export type RequirementAssessmentInput = {
+	requirementId: string;
+	verdict: string;
+	eventSequences: number[];
 };
 
 export function requirementsFromObjective(objective: string): string[] {
@@ -45,8 +53,60 @@ export async function validateCompletionSummary(
 	return missingEvidence(requirements, summary, evidence);
 }
 
+/**
+ * Validate that every requirement has an assessment and that cited sequences
+ * exist in the active run. Does not judge semantic sufficiency of verdicts.
+ */
+export function validateAssessmentProvenance(
+	requirements: string[],
+	assessments: RequirementAssessmentInput[],
+	knownEventSequences: ReadonlySet<number>,
+): string | undefined {
+	if (requirements.length === 0) {
+		return undefined;
+	}
+
+	if (assessments.length === 0) {
+		return "Completion assessments are missing.";
+	}
+
+	for (let index = 0; index < requirements.length; index += 1) {
+		const requirement = requirements[index]!;
+		const matches = assessments.filter((assessment) =>
+			assessmentCoversRequirement(assessment, index, requirement),
+		);
+		if (matches.length === 0) {
+			return `Requirement ${index + 1} is missing an assessment.`;
+		}
+		for (const assessment of matches) {
+			if (!assessment.verdict.trim()) {
+				return `Requirement ${index + 1} assessment is missing a verdict.`;
+			}
+			if (assessment.eventSequences.length === 0) {
+				return `Requirement ${index + 1} assessment is missing event references.`;
+			}
+			for (const sequence of assessment.eventSequences) {
+				if (!knownEventSequences.has(sequence)) {
+					return `Requirement ${index + 1} cites missing or cross-run event sequence ${sequence}.`;
+				}
+			}
+		}
+	}
+
+	return undefined;
+}
+
 export function summaryReportsFailure(summary: string): boolean {
 	return /\b(failed|failing)\b/i.test(summary);
+}
+
+function assessmentCoversRequirement(
+	assessment: RequirementAssessmentInput,
+	index: number,
+	requirement: string,
+): boolean {
+	const id = assessment.requirementId.trim();
+	return id === String(index + 1) || id === `REQ-${index + 1}` || id === requirement;
 }
 
 function hasContradiction(summary: string): boolean {
@@ -77,12 +137,12 @@ function requirementSections(summary: string): Map<number, string> {
 	const sections = new Map<number, string>();
 
 	for (let markerIndex = 0; markerIndex < markers.length; markerIndex += 1) {
-		const requirementNumber = Number(markers[markerIndex][1]);
+		const requirementNumber = Number(markers[markerIndex]![1]);
 		if (sections.has(requirementNumber)) {
 			continue;
 		}
 
-		const start = markers[markerIndex].index ?? 0;
+		const start = markers[markerIndex]!.index ?? 0;
 		const end = markers[markerIndex + 1]?.index ?? summary.length;
 		sections.set(requirementNumber, summary.slice(start, end));
 	}
@@ -97,6 +157,14 @@ async function hasGroundedEvidence(
 ): Promise<boolean> {
 	if (delegationCitations.some((value) => section.includes(value))) {
 		return true;
+	}
+
+	// Event-sequence citations like #3 or seq:3 from the projected context.
+	if (evidence.knownEventSequences && evidence.knownEventSequences.size > 0) {
+		const cited = [...section.matchAll(/(?:#|seq:)\s*(\d+)\b/gi)].map((match) => Number(match[1]));
+		if (cited.length > 0 && cited.every((sequence) => evidence.knownEventSequences!.has(sequence))) {
+			return true;
+		}
 	}
 
 	if (!evidence.runId) {

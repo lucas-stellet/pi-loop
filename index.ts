@@ -3,19 +3,31 @@ import { Type } from "typebox";
 
 import { isSupervisorToolName, SUPERVISOR_TOOL_NAMES } from "./src/constants.ts";
 import { ControlFilePolicyError, seedControlFiles, writeControlFile } from "./src/control-files.ts";
-import { summaryReportsFailure, validateCompletionSummary } from "./src/completion.ts";
-import { createJournal } from "./src/journal.ts";
+import {
+	summaryReportsFailure,
+	validateAssessmentProvenance,
+	validateCompletionSummary,
+	type RequirementAssessmentInput,
+} from "./src/completion.ts";
+import { createJournal, type JournalEvent } from "./src/journal.ts";
 import { activeLoopState, initialLoopState, lastPersistedLoopState, type LoopState } from "./src/loop-state.ts";
+import {
+	projectRunContext,
+	type ProjectableEvent,
+} from "./src/projection.ts";
 import { textResult } from "./src/tool-result.ts";
 
 const SUPERVISOR_SYSTEM_PROMPT = [
 	"You are the active loop supervisor: a control-plane orchestrator, not an executor.",
 	"Delegate implementation, file inspection, shell execution, testing, and review work to appropriate workers instead of doing it directly.",
 	"Track delegated evidence and decide the next supervisor action.",
+	"Use the projected decision context below; do not scan raw JSONL or full child logs.",
 ].join(" ");
 
 const LOOP_CONTINUATION_CONTENT =
 	"Continue supervising the objective: decide the next action, delegate work, and complete only with evidence.";
+
+const DECISION_CONTEXT_MAX_CHARS = 4000;
 
 type LoopEventKind =
 	| "loop.started"
@@ -25,23 +37,44 @@ type LoopEventKind =
 	| "loop.completed"
 	| "loop.failed"
 	| "loop.budget_limited"
-	| "loop.guardrail_violation";
+	| "loop.guardrail_violation"
+	| "loop.iteration"
+	| "delegation.updated"
+	| "supervisor.assessment";
 
 type LoopEventPayload = Record<string, unknown>;
 
-function formatLoopStatus(state: LoopState): string {
+function toProjectableEvents(events: readonly JournalEvent[]): ProjectableEvent[] {
+	const projectable: ProjectableEvent[] = [];
+	for (const event of events) {
+		if (typeof event.runId !== "string") {
+			continue;
+		}
+		projectable.push({
+			schemaVersion: 1,
+			runId: event.runId,
+			sequence: event.sequence,
+			timestamp: event.timestamp,
+			kind: event.kind,
+			payload: event.payload,
+		});
+	}
+	return projectable;
+}
+
+function formatLoopStatus(state: LoopState, projectedContext?: string): string {
 	if (state.state === "idle") {
 		return `Loop state: ${state.state}`;
 	}
 
 	const elapsedSeconds = state.startedAt === undefined ? 0 : Math.floor((Date.now() - state.startedAt) / 1000);
 	const tokenBudget = state.maxTokens === undefined ? "" : `\nMax tokens: ${state.maxTokens}`;
-	return (
+	const base =
 		`Loop state: ${state.state}\n` +
 		`Objective: ${state.objective}\n` +
 		`Iterations: ${state.iterationsUsed}/${state.maxIterations}\n` +
-		`Elapsed: ${elapsedSeconds}s${tokenBudget}`
-	);
+		`Elapsed: ${elapsedSeconds}s${tokenBudget}`;
+	return projectedContext ? `${base}\n\n${projectedContext}` : base;
 }
 
 /**
@@ -162,6 +195,7 @@ export default function piLoop(pi: ExtensionAPI): void {
 			return;
 		}
 		loopState = { ...loopState, iterationsUsed };
+		await appendLoopEvent("loop.iteration", { used: iterationsUsed });
 		persist();
 	});
 
@@ -185,11 +219,18 @@ export default function piLoop(pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_agent_start", () => {
-		if (loopState.state !== "active") {
+		if (loopState.state !== "active" || !loopState.runId) {
 			return undefined;
 		}
 
-		return { systemPrompt: SUPERVISOR_SYSTEM_PROMPT };
+		const { context } = projectRunContext({
+			runId: loopState.runId,
+			events: toProjectableEvents(journal.getEvents()),
+			maxCharacters: DECISION_CONTEXT_MAX_CHARS,
+		});
+		return {
+			systemPrompt: `${SUPERVISOR_SYSTEM_PROMPT}\n\n${context}`,
+		};
 	});
 
 	pi.on("session_before_compact", () => {
@@ -230,7 +271,15 @@ export default function piLoop(pi: ExtensionAPI): void {
 			try {
 				// Commit active state only after durable start/init; on failure roll tools/guard back to idle surface.
 				await syncJournalRun(nextLoopState, ctx.cwd);
-				await appendLoopEvent("loop.started", { objective: params.objective }, nextLoopState);
+				await appendLoopEvent(
+					"loop.started",
+					{
+						objective: params.objective,
+						maxIterations: nextLoopState.maxIterations,
+						...(nextLoopState.maxTokens === undefined ? {} : { tokenBudget: nextLoopState.maxTokens }),
+					},
+					nextLoopState,
+				);
 				persist();
 			} catch (error) {
 				restoreToolSurface(previousSurface);
@@ -290,17 +339,41 @@ export default function piLoop(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "loop_complete",
 		label: "Loop Complete",
-		description: "Complete loop supervisor mode after verifying each requirement against evidence.",
+		description:
+			"Complete loop supervisor mode after verifying each requirement against evidence. Optional assessments cite projected current-run event sequences.",
 		parameters: Type.Object({
 			summary: Type.String(),
+			assessments: Type.Optional(
+				Type.Array(
+					Type.Object({
+						requirementId: Type.String(),
+						verdict: Type.String(),
+						eventSequences: Type.Array(Type.Number()),
+					}),
+				),
+			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const summary = params.summary.trim();
-			const error = await validateCompletionSummary(loopState.requirements, summary, {
+			const assessments = (params.assessments ?? []) as RequirementAssessmentInput[];
+			const knownEventSequences = new Set(
+				journal
+					.getEvents()
+					.filter((event) => event.runId === loopState.runId)
+					.map((event) => event.sequence),
+			);
+
+			const summaryError = await validateCompletionSummary(loopState.requirements, summary, {
 				cwd: ctx.cwd,
 				runId: loopState.runId,
 				entries: ctx.sessionManager.getEntries(),
+				knownEventSequences,
 			});
+			const assessmentError =
+				assessments.length === 0
+					? undefined
+					: validateAssessmentProvenance(loopState.requirements, assessments, knownEventSequences);
+			const error = summaryError ?? assessmentError;
 			if (error) {
 				if (summaryReportsFailure(summary)) {
 					await appendLoopEvent("loop.failed", { summary });
@@ -309,6 +382,17 @@ export default function piLoop(pi: ExtensionAPI): void {
 					persist();
 				}
 				throw new Error(error);
+			}
+
+			for (const assessment of assessments) {
+				await appendLoopEvent("supervisor.assessment", {
+					requirementId: assessment.requirementId,
+					verdict: assessment.verdict,
+					references: assessment.eventSequences.map((sequence) => ({
+						runId: loopState.runId,
+						sequence,
+					})),
+				});
 			}
 
 			await appendLoopEvent("loop.completed", { summary });
@@ -322,10 +406,18 @@ export default function piLoop(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "loop_status",
 		label: "Loop Status",
-		description: "Show current loop supervisor state.",
+		description: "Show current loop supervisor state and projected decision context.",
 		parameters: Type.Object({}),
 		async execute() {
-			return textResult(formatLoopStatus(loopState));
+			if (!loopState.runId || loopState.state === "idle") {
+				return textResult(formatLoopStatus(loopState));
+			}
+			const { context } = projectRunContext({
+				runId: loopState.runId,
+				events: toProjectableEvents(journal.getEvents()),
+				maxCharacters: DECISION_CONTEXT_MAX_CHARS,
+			});
+			return textResult(formatLoopStatus(loopState, context));
 		},
 	});
 
@@ -342,7 +434,14 @@ export default function piLoop(pi: ExtensionAPI): void {
 			if (!loopState.runId) {
 				throw new Error("loop_delegate requires an active loop run.");
 			}
+			const childId = params.name ?? params.target ?? "delegate";
 			pi.appendEntry("loop-delegation", { ...params, runId: loopState.runId });
+			await appendLoopEvent("delegation.updated", {
+				childId,
+				status: "recorded",
+				artifactRefs: [],
+			});
+			persist();
 			return textResult("Delegation intent recorded.");
 		},
 	});

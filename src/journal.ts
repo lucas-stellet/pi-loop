@@ -21,7 +21,7 @@ const SETTLEMENT_KINDS = new Set([
 	"loop.budget_limited",
 ]);
 
-type JournalEvent = {
+export type JournalEvent = {
 	schemaVersion: typeof SCHEMA_VERSION;
 	runId: string | undefined;
 	sequence: number;
@@ -41,6 +41,7 @@ export type Journal = {
 	isHealthy(): boolean;
 	getRunId(): string | undefined;
 	getSequence(): number;
+	getEvents(): readonly JournalEvent[];
 };
 
 export type DiskJournal = Omit<Journal, "startRun" | "appendEvent"> & {
@@ -103,6 +104,22 @@ function validateEvent(value: unknown, runId: string, expectedSequence: number):
 	}
 }
 
+function eventSnapshot(events: readonly JournalEvent[]): readonly JournalEvent[] {
+	return structuredClone(events);
+}
+
+function createEvent(
+	runId: string,
+	sequence: number,
+	kind: string,
+	payload: Record<string, unknown>,
+): DiskJournalEvent;
+function createEvent(
+	runId: string | undefined,
+	sequence: number,
+	kind: string,
+	payload: Record<string, unknown>,
+): JournalEvent;
 function createEvent(
 	runId: string | undefined,
 	sequence: number,
@@ -115,7 +132,8 @@ function createEvent(
 		sequence,
 		timestamp: Date.now(),
 		kind,
-		payload,
+		// Clone so later mutation of the caller's payload object cannot rewrite authority.
+		payload: structuredClone(payload),
 	};
 }
 
@@ -124,6 +142,7 @@ function createSessionJournal(appendEntry: AppendEntry): Journal {
 	let sequence = 0;
 	let healthy = true;
 	let snapshot: LoopState | undefined;
+	let events: JournalEvent[] = [];
 
 	function persist(customType: string, data: unknown) {
 		try {
@@ -138,6 +157,7 @@ function createSessionJournal(appendEntry: AppendEntry): Journal {
 		startRun(nextRunId: string, initialSequence = 0) {
 			runId = nextRunId;
 			sequence = initialSequence;
+			events = [];
 			healthy = true;
 		},
 		appendEvent(kind: string, payload: Record<string, unknown> = {}) {
@@ -145,6 +165,7 @@ function createSessionJournal(appendEntry: AppendEntry): Journal {
 			const event = createEvent(runId, nextSequence, kind, payload);
 			persist(EVENT_ENTRY_TYPE, event);
 			sequence = nextSequence;
+			events.push(event);
 		},
 		updateSnapshot(state: LoopState) {
 			persist(SNAPSHOT_ENTRY_TYPE, state);
@@ -162,6 +183,9 @@ function createSessionJournal(appendEntry: AppendEntry): Journal {
 		getSequence() {
 			return sequence;
 		},
+		getEvents() {
+			return eventSnapshot(events);
+		},
 	};
 }
 
@@ -170,6 +194,7 @@ function createDiskJournal(appendEntry: AppendEntry, options: DiskOptions): Disk
 	let sequence = 0;
 	let healthy = true;
 	let snapshot: LoopState | undefined;
+	let events: DiskJournalEvent[] = [];
 	// Single serialized writer: sequence assignment + durable append + optional settlement + mirror.
 	let queue = Promise.resolve();
 
@@ -208,6 +233,7 @@ function createDiskJournal(appendEntry: AppendEntry, options: DiskOptions): Disk
 			}
 
 			let replayedSequence = 0;
+			const replayedEvents: DiskJournalEvent[] = [];
 			for (const line of content.split("\n")) {
 				if (!line) {
 					continue;
@@ -219,11 +245,13 @@ function createDiskJournal(appendEntry: AppendEntry, options: DiskOptions): Disk
 					throw new Error("Loop journal contains an invalid event record.");
 				}
 				validateEvent(event, nextRunId, replayedSequence + 1);
+				replayedEvents.push(event);
 				replayedSequence += 1;
 			}
 
 			runId = nextRunId;
 			sequence = replayedSequence;
+			events = replayedEvents;
 		} finally {
 			await handle?.close();
 		}
@@ -248,6 +276,7 @@ function createDiskJournal(appendEntry: AppendEntry, options: DiskOptions): Disk
 			}
 			// Advance only after the durable write path succeeds; poison still leaves replay as authority.
 			sequence = event.sequence;
+			events.push(event);
 			persistMirror(EVENT_ENTRY_TYPE, event);
 		} finally {
 			await handle?.close();
@@ -303,6 +332,9 @@ function createDiskJournal(appendEntry: AppendEntry, options: DiskOptions): Disk
 		},
 		getSequence() {
 			return sequence;
+		},
+		getEvents() {
+			return eventSnapshot(events);
 		},
 	};
 }

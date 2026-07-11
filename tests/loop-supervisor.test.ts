@@ -1262,3 +1262,117 @@ test("active compaction recovery cannot corrupt pre-loop tool restoration", asyn
 
 	assert.deepEqual(harness.activeTools, PRE_LOOP_TOOLS);
 });
+
+test("before_agent_start injects the latest projected decision context without raw JSONL", async () => {
+	const harness = createHarness();
+	piLoop(harness.pi as never);
+	await executeTool(harness, "loop_start", {
+		objective: "Coordinate implementation through delegated workers",
+		maxIterations: 4,
+	});
+	await executeTool(harness, "loop_delegate", { task: "Implement the projector", name: "worker-1" });
+
+	const beforeAgentStart = requiredHandler(
+		harness,
+		"before_agent_start",
+		"active loop mode must install a before_agent_start prompt hook",
+	);
+	const result = await beforeAgentStart({ type: "before_agent_start" }, harness.ctx);
+	const prompt = result?.systemPrompt as string;
+	assert.match(prompt, /orchestrator|control-plane/i);
+	assert.match(prompt, /Loop decision context/);
+	assert.match(prompt, /Lifecycle: active/);
+	assert.match(prompt, /delegation worker-1/);
+	assert.doesNotMatch(prompt, /"schemaVersion"|events\.jsonl/);
+});
+
+test("loop_status consumes the same projection as supervisor decision context", async () => {
+	const harness = createHarness();
+	piLoop(harness.pi as never);
+	await executeTool(harness, "loop_start", {
+		objective: "Ship projected status",
+		maxIterations: 3,
+		maxTokens: 123,
+	});
+	await executeTool(harness, "loop_delegate", { task: "Gather evidence", name: "status-worker" });
+
+	const status = resultText(await executeTool(harness, "loop_status", {}));
+	assert.match(status, /active/i);
+	assert.match(status, /Ship projected status/);
+	assert.match(status, /0\s*\/\s*3/);
+	assert.match(status, /Loop decision context/);
+	assert.match(status, /delegation status-worker/);
+	assert.match(status, /highWater=/);
+});
+
+test("loop_complete journals assessments and rejects missing or cross-run event provenance", async () => {
+	const harness = createHarness();
+	piLoop(harness.pi as never);
+	await executeTool(harness, "loop_start", {
+		objective: ["Requirements:", "1. Record the plan.", "2. Record the verification."].join("\n"),
+	});
+	await executeTool(harness, "loop_write", { file: "plan.md", content: "plan body" });
+	await executeTool(harness, "loop_write", { file: "evidence.md", content: "evidence body" });
+	await executeTool(harness, "loop_delegate", { task: "Verify plan and evidence", name: "verifier" });
+
+	const knownSequences = loopEvents(harness).map((event) => event.sequence as number);
+	assert.ok(knownSequences.length >= 2);
+
+	await assert.rejects(
+		() =>
+			executeTool(harness, "loop_complete", {
+				summary: "Requirement 1: Evidence: plan.md.\nRequirement 2: Evidence: evidence.md.",
+				assessments: [
+					{ requirementId: "1", verdict: "satisfied", eventSequences: [knownSequences[0]] },
+					// Missing assessment for requirement 2 intentionally omitted after first only — actually both needed.
+				],
+			}),
+		/Requirement 2|missing an assessment/i,
+	);
+
+	await assert.rejects(
+		() =>
+			executeTool(harness, "loop_complete", {
+				summary: "Requirement 1: Evidence: plan.md.\nRequirement 2: Evidence: evidence.md.",
+				assessments: [
+					{ requirementId: "1", verdict: "satisfied", eventSequences: [999] },
+					{ requirementId: "2", verdict: "satisfied", eventSequences: [knownSequences[0]] },
+				],
+			}),
+		/missing or cross-run event sequence 999/i,
+	);
+
+	const complete = await executeTool(harness, "loop_complete", {
+		summary: "Requirement 1: Evidence: plan.md.\nRequirement 2: Evidence: evidence.md.",
+		assessments: [
+			{ requirementId: "1", verdict: "satisfied", eventSequences: [knownSequences[0]!] },
+			{ requirementId: "2", verdict: "satisfied", eventSequences: [knownSequences.at(-1)!] },
+		],
+	});
+	assert.match(resultText(complete), /complete/i);
+	assert.equal(lastLoopState(harness).state, "complete");
+
+	const assessmentEvents = loopEvents(harness).filter((event) => event.kind === "supervisor.assessment");
+	assert.equal(assessmentEvents.length, 2);
+	assert.deepEqual(
+		assessmentEvents.map((event) => (event.payload as { requirementId: string }).requirementId),
+		["1", "2"],
+	);
+});
+
+test("summary completion may cite projected event sequences as current-run evidence", async () => {
+	const harness = createHarness();
+	piLoop(harness.pi as never);
+	await executeTool(harness, "loop_start", {
+		objective: "Requirements:\n1. Ship the feature.",
+	});
+	await executeTool(harness, "loop_delegate", { task: "Ship it", name: "shipper" });
+	const delegationSequence = loopEvents(harness).find((event) => event.kind === "delegation.updated")?.sequence;
+	assert.equal(typeof delegationSequence, "number");
+
+	const complete = await executeTool(harness, "loop_complete", {
+		summary: `Requirement 1: verified. Evidence: #${delegationSequence}.`,
+	});
+	assert.match(resultText(complete), /complete/i);
+	assert.equal(lastLoopState(harness).state, "complete");
+});
