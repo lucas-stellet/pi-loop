@@ -50,14 +50,18 @@ async function assertRealDirectory(path: string): Promise<void> {
 	}
 }
 
-async function ensureControlDirectory(cwd: string, runId: string): Promise<string> {
+async function assertExistingControlDirectory(cwd: string, runId: string): Promise<string> {
 	const directory = controlDirectory(cwd, runId);
-	await mkdir(directory, { recursive: true });
-
 	for (const path of [resolve(cwd, ".pi"), resolve(cwd, ".pi", "loop"), directory]) {
 		await assertRealDirectory(path);
 	}
 	return directory;
+}
+
+async function ensureControlDirectory(cwd: string, runId: string): Promise<string> {
+	const directory = controlDirectory(cwd, runId);
+	await mkdir(directory, { recursive: true });
+	return assertExistingControlDirectory(cwd, runId);
 }
 
 function isSafeRegularSingleLink(stat: { isFile(): boolean; nlink: number }): boolean {
@@ -83,6 +87,35 @@ async function assertWritableDestination(destination: string): Promise<void> {
 
 export async function seedControlFiles(cwd: string, runId: string, objective: string): Promise<void> {
 	await writeControlFile(cwd, runId, "objective.md", objective);
+}
+
+/** Returns safe, non-whitespace control content, or undefined when unavailable as evidence. */
+export async function readControlFile(cwd: string, runId: string, file: string): Promise<string | undefined> {
+	if (!isLoopControlFile(file)) {
+		return undefined;
+	}
+
+	let handle: FileHandle | undefined;
+	try {
+		const directory = await assertExistingControlDirectory(cwd, runId);
+		const destination = join(directory, file);
+		const stat = await lstat(destination);
+		// Preserve symlink classification before the regular/single-link safety check.
+		if (stat.isSymbolicLink() || !isSafeRegularSingleLink(stat)) {
+			return undefined;
+		}
+
+		handle = await open(destination, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+		if (!isSafeRegularSingleLink(await handle.stat())) {
+			return undefined;
+		}
+		const content = await handle.readFile("utf8");
+		return content.trim().length > 0 ? content : undefined;
+	} catch {
+		return undefined;
+	} finally {
+		await handle?.close();
+	}
 }
 
 export async function writeControlFile(cwd: string, runId: string, file: string, content: string): Promise<void> {

@@ -58,6 +58,7 @@ type MockContext = {
 	sessionManager: {
 		getEntries: () => unknown[];
 	};
+	hasPendingMessages: () => boolean;
 	abort: () => void;
 	ui: {
 		notify: (message: string, type?: "info" | "warning" | "error") => void;
@@ -69,9 +70,11 @@ function createHarness(options: {
 	cwd?: string;
 	failAppendEntry?: (customType: string, data: unknown) => boolean;
 	failSetActiveTools?: boolean;
+	pendingMessages?: boolean;
 } = {}) {
 	const tools = new Map<string, RegisteredTool>();
 	const handlers = new Map<string, Function[]>();
+	const sentMessages: Array<{ message: unknown; options: unknown }> = [];
 	const setActiveToolsCalls: string[][] = [];
 	const appendEntries: Array<{ customType: string; data: unknown }> = [];
 	const notifications: Array<{ message: string; type?: string }> = [];
@@ -105,6 +108,9 @@ function createHarness(options: {
 			appendEntries.push({ customType, data });
 			sessionEntries.push({ type: "custom", customType, data });
 		},
+		sendMessage(message: unknown, messageOptions: unknown) {
+			sentMessages.push({ message, options: messageOptions });
+		},
 	};
 
 	const ctx: MockContext = {
@@ -114,6 +120,7 @@ function createHarness(options: {
 		sessionManager: {
 			getEntries: () => sessionEntries,
 		},
+		hasPendingMessages: () => options.pendingMessages ?? false,
 		abort: () => {
 			aborted = true;
 		},
@@ -131,6 +138,7 @@ function createHarness(options: {
 		setActiveToolsCalls,
 		appendEntries,
 		notifications,
+		sentMessages,
 		get activeTools() {
 			return activeTools;
 		},
@@ -606,7 +614,7 @@ test("reload and compaction retain the persisted run control directory", async (
 	});
 });
 
-test("loop_complete throws for empty, contradictory, and missing-evidence summaries before accepting requirement evidence", async () => {
+test("loop_complete rejects empty, contradictory, word-only, and missing evidence before accepting current-run delegation evidence", async () => {
 	const harness = createHarness();
 	piLoop(harness.pi as never);
 	await executeTool(harness, "loop_start", {
@@ -642,16 +650,207 @@ test("loop_complete throws for empty, contradictory, and missing-evidence summar
 	);
 	assert.equal(lastLoopState(harness).state, "active");
 
+	await assert.rejects(
+		() =>
+			executeTool(harness, "loop_complete", {
+				summary: [
+					"Requirement 1: verified. Evidence.",
+					"Requirement 2: verified. Evidence.",
+				].join("\n"),
+			}),
+		/missing evidence|Requirement 1/i,
+	);
+	assert.equal(lastLoopState(harness).state, "active");
+
+	await executeTool(harness, "loop_delegate", {
+		task: "Verify restricted supervisor tools are installed",
+	});
+	await executeTool(harness, "loop_delegate", {
+		task: "Verify the runtime guard blocks prohibited built-ins",
+	});
+	const delegationEntries = harness.appendEntries.filter((entry) => entry.customType === "loop-delegation");
+	assert.equal(
+		(delegationEntries.at(-1)?.data as { runId?: unknown }).runId,
+		lastLoopState(harness).runId,
+		"delegation evidence must be scoped to the active run",
+	);
 	const complete = await executeTool(harness, "loop_complete", {
 		summary: [
-			"Requirement 1: verified. Evidence: delegated start-mode test showed restricted supervisor tools installed.",
-			"Requirement 2: verified. Evidence: delegated tool-call guard test blocked bash/read/write at runtime.",
+			"Requirement 1: verified. Evidence: Verify restricted supervisor tools are installed.",
+			"Requirement 2: verified. Evidence: Verify the runtime guard blocks prohibited built-ins.",
 		].join("\n"),
 	});
 	assert.match(resultText(complete), /complete/i);
 	assert.equal(lastLoopState(harness).state, "complete");
 	assert.deepEqual(harness.setActiveToolsCalls.at(-1), PRE_LOOP_TOOLS);
 	assert.deepEqual(harness.activeTools, PRE_LOOP_TOOLS);
+	await requiredHandler(harness, "agent_end", "completed loops retain continuation hook")(
+		{ type: "agent_end", messages: [] },
+		harness.ctx,
+	);
+	assert.equal(harness.sentMessages.length, 0);
+});
+
+test("loop_complete accepts a cited non-empty current-run control artifact for each requirement", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		const harness = createHarness({ cwd });
+		piLoop(harness.pi as never);
+		await executeTool(harness, "loop_start", {
+			objective: "Requirements:\n1. Record the plan.\n2. Record the verification.",
+		});
+		await executeTool(harness, "loop_write", { file: "plan.md", content: "implemented plan" });
+		await executeTool(harness, "loop_write", { file: "evidence.md", content: "verification passed" });
+
+		const complete = await executeTool(harness, "loop_complete", {
+			summary: "Requirement 1: Evidence: plan.md.\nRequirement 2: Evidence: evidence.md.",
+		});
+		assert.match(resultText(complete), /complete/i);
+		assert.equal(lastLoopState(harness).state, "complete");
+	});
+});
+
+test("loop_complete rejects delegation and artifact citations that are not safe current-run evidence", async () => {
+	const rejectedSummary = "Requirement 1: verified. Evidence: evidence.md.";
+
+	await withTemporaryCwd(async (cwd) => {
+		const harness = createHarness({ cwd });
+		piLoop(harness.pi as never);
+		await executeTool(harness, "loop_start", { objective: "Use only current-run evidence" });
+		await executeTool(harness, "loop_delegate", { task: "prior-run delegated task" });
+		await executeTool(harness, "loop_write", { file: "evidence.md", content: "old evidence" });
+		await executeTool(harness, "loop_clear", {});
+		await executeTool(harness, "loop_start", { objective: "Use only current-run evidence" });
+
+		await assert.rejects(
+			() => executeTool(harness, "loop_complete", { summary: "Requirement 1: prior-run delegated task." }),
+			/missing evidence|Requirement 1/i,
+		);
+		await assert.rejects(() => executeTool(harness, "loop_complete", { summary: rejectedSummary }), /missing evidence|Requirement 1/i);
+	});
+
+	await withTemporaryCwd(async (cwd) => {
+		const harness = createHarness({ cwd });
+		piLoop(harness.pi as never);
+		await executeTool(harness, "loop_start", { objective: "Reject embedded artifact names" });
+
+		await assert.rejects(
+			() =>
+				executeTool(harness, "loop_complete", {
+					summary: "Requirement 1: Evidence: nonexistent-objective.md.",
+				}),
+			/missing evidence|Requirement 1/i,
+			"an approved basename embedded in another filename must not count as evidence",
+		);
+	});
+
+	await withTemporaryCwd(async (cwd) => {
+		const harness = createHarness({ cwd });
+		piLoop(harness.pi as never);
+		await executeTool(harness, "loop_start", { objective: "Create an earlier run" });
+		const priorRunId = lastLoopState(harness).runId;
+		assert.equal(typeof priorRunId, "string");
+		await executeTool(harness, "loop_clear", {});
+		await executeTool(harness, "loop_start", { objective: "Reject prior-run artifact paths" });
+		await executeTool(harness, "loop_write", { file: "evidence.md", content: "current evidence" });
+
+		await assert.rejects(
+			() =>
+				executeTool(harness, "loop_complete", {
+					summary: `Requirement 1: Evidence: .pi/loop/${priorRunId}/evidence.md.`,
+				}),
+			/missing evidence|Requirement 1/i,
+			"a prior-run path must not alias the active run's artifact",
+		);
+	});
+
+	for (const unsafeArtifact of ["missing", "whitespace", "symlink", "hard-link"] as const) {
+		await withTemporaryCwd(async (cwd) => {
+			const harness = createHarness({ cwd });
+			piLoop(harness.pi as never);
+			await executeTool(harness, "loop_start", { objective: "Reject unsafe evidence artifacts" });
+			const evidencePath = join(activeControlDirectory(harness), "evidence.md");
+			if (unsafeArtifact === "whitespace") {
+				await writeFile(evidencePath, " \n\t", "utf8");
+			} else if (unsafeArtifact === "symlink") {
+				const outside = join(cwd, "outside.md");
+				await writeFile(outside, "outside evidence", "utf8");
+				await symlink(outside, evidencePath);
+			} else if (unsafeArtifact === "hard-link") {
+				const outside = join(cwd, "outside.md");
+				await writeFile(outside, "outside evidence", "utf8");
+				await link(outside, evidencePath);
+			}
+
+			await assert.rejects(
+				() => executeTool(harness, "loop_complete", { summary: rejectedSummary }),
+				/missing evidence|Requirement 1/i,
+				`${unsafeArtifact} artifact must not count as completion evidence`,
+			);
+		});
+	}
+});
+
+test("agent_end queues one custom continuation for an active loop without pending user input", async () => {
+	const harness = createHarness();
+	piLoop(harness.pi as never);
+	await executeTool(harness, "loop_start", { objective: "Continue coordinating delegated work" });
+
+	const agentEnd = requiredHandler(harness, "agent_end", "active loop mode must install an agent_end continuation hook");
+	await agentEnd({ type: "agent_end", messages: [] }, harness.ctx);
+	await agentEnd({ type: "agent_end", messages: [] }, harness.ctx);
+
+	assert.equal(harness.sentMessages.length, 1);
+	const [{ message, options }] = harness.sentMessages as Array<{
+		message: { customType?: unknown; content?: unknown };
+		options: unknown;
+	}>;
+	assert.equal(message.customType, "loop-continuation");
+	assert.match(String(message.content), /continue|objective|delegate/i);
+	assert.deepEqual(options, { deliverAs: "followUp", triggerTurn: true });
+});
+
+test("agent_end suppresses continuation for pending input and every non-active lifecycle state", async () => {
+	const pending = createHarness({ pendingMessages: true });
+	piLoop(pending.pi as never);
+	await executeTool(pending, "loop_start", { objective: "Wait for user input" });
+	await requiredHandler(pending, "agent_end", "continuation hook required")({ type: "agent_end", messages: [] }, pending.ctx);
+	assert.equal(pending.sentMessages.length, 0);
+
+	for (const state of ["paused", "complete", "budget_limited", "failed", "idle"] as const) {
+		const harness = createHarness();
+		piLoop(harness.pi as never);
+		await executeTool(harness, "loop_start", { objective: "Suppress terminal continuation", maxIterations: 1 });
+		if (state === "paused") {
+			await executeTool(harness, "loop_pause", {});
+		} else if (state === "complete") {
+			await executeTool(harness, "loop_delegate", { task: "Complete the only requirement" });
+			await executeTool(harness, "loop_complete", { summary: "Requirement 1: Evidence: Complete the only requirement." });
+		} else if (state === "budget_limited") {
+			await requiredHandler(harness, "agent_start", "iteration hook required")({ type: "agent_start" }, harness.ctx);
+		} else if (state === "failed") {
+			await assert.rejects(() => executeTool(harness, "loop_complete", { summary: "Requirement 1 failed." }));
+		} else {
+			await executeTool(harness, "loop_clear", {});
+		}
+		await requiredHandler(harness, "agent_end", "continuation hook required")({ type: "agent_end", messages: [] }, harness.ctx);
+		assert.equal(harness.sentMessages.length, 0, `${state} loop must not continue`);
+	}
+});
+
+test("agent_start resets the continuation guard for exactly one next eligible agent_end", async () => {
+	const harness = createHarness();
+	piLoop(harness.pi as never);
+	await executeTool(harness, "loop_start", { objective: "Reset continuation scheduling" });
+	const agentEnd = requiredHandler(harness, "agent_end", "continuation hook required");
+	const agentStart = requiredHandler(harness, "agent_start", "iteration hook required");
+
+	await agentEnd({ type: "agent_end", messages: [] }, harness.ctx);
+	await agentEnd({ type: "agent_end", messages: [] }, harness.ctx);
+	await agentStart({ type: "agent_start" }, harness.ctx);
+	await agentEnd({ type: "agent_end", messages: [] }, harness.ctx);
+	await agentEnd({ type: "agent_end", messages: [] }, harness.ctx);
+
+	assert.equal(harness.sentMessages.length, 2);
 });
 
 test("before_agent_start injects a supervisor control-plane prompt while loop mode is active", async () => {
@@ -665,11 +864,16 @@ test("before_agent_start injects a supervisor control-plane prompt while loop mo
 	const result = await beforeAgentStart({ type: "before_agent_start" }, harness.ctx);
 	const prompt = result?.systemPrompt;
 	assert.equal(typeof prompt, "string");
-	assert.match(prompt, /supervisor|orchestrator|control-plane/i);
-	assert.match(prompt, /delegat/i);
+	assert.match(prompt, /orchestrator|control-plane/i);
+	assert.match(prompt, /not an executor/i);
+	assert.match(prompt, /delegat[^.]*implementation/i);
+	assert.match(prompt, /delegat[^.]*inspection/i);
+	assert.match(prompt, /delegat[^.]*shell execution/i);
+	assert.match(prompt, /delegat[^.]*testing/i);
+	assert.match(prompt, /delegat[^.]*review/i);
 });
 
-test("before_agent_start exhausts maxIterations into budget_limited and restores pre-loop tools", async () => {
+test("agent_start counts automatic continuations against maxIterations without double-counting ordinary turns", async () => {
 	const harness = createHarness();
 	piLoop(harness.pi as never);
 	await executeTool(harness, "loop_start", {
@@ -677,19 +881,34 @@ test("before_agent_start exhausts maxIterations into budget_limited and restores
 		maxIterations: 2,
 	});
 
-	const [beforeAgentStart] = harness.handlers.get("before_agent_start") ?? [];
-	assert.ok(beforeAgentStart, "iteration budgeting must run from before_agent_start");
+	const beforeAgentStart = requiredHandler(
+		harness,
+		"before_agent_start",
+		"active loop mode must install a prompt hook",
+	);
+	const agentStart = requiredHandler(harness, "agent_start", "active loop mode must count every agent start");
 
 	await beforeAgentStart({ type: "before_agent_start" }, harness.ctx);
-	await beforeAgentStart({ type: "before_agent_start" }, harness.ctx);
+	await agentStart({ type: "agent_start" }, harness.ctx);
+	assert.equal(lastLoopState(harness).iterationsUsed, 1);
+	assert.equal(lastLoopState(harness).state, "active");
 
+	// Pi follow-ups call agent.continue(), which emits agent_start without before_agent_start.
+	await agentStart({ type: "agent_start" }, harness.ctx);
+
+	assert.equal(lastLoopState(harness).iterationsUsed, 2);
 	assert.equal(lastLoopState(harness).state, "budget_limited");
 	assert.deepEqual(harness.setActiveToolsCalls.at(-1), PRE_LOOP_TOOLS);
+	await requiredHandler(harness, "agent_end", "budget-limited loops must retain continuation hook")(
+		{ type: "agent_end", messages: [] },
+		harness.ctx,
+	);
+	assert.equal(harness.sentMessages.length, 0);
 	const status = await executeTool(harness, "loop_status", {});
 	assert.match(resultText(status), /budget_limited/);
 });
 
-test("loop_complete failure summaries transition to a failed state observable via loop_status", async () => {
+test("loop_complete failure summaries reject, persist failed, restore tools, and permanently stop continuation", async () => {
 	const harness = createHarness();
 	piLoop(harness.pi as never);
 	await executeTool(harness, "loop_start", { objective: "Make failed loop state observable" });
@@ -702,6 +921,15 @@ test("loop_complete failure summaries transition to a failed state observable vi
 		/failed|failing|contradict/i,
 	);
 
+	assert.equal(lastLoopState(harness).state, "failed");
+	assert.deepEqual(harness.activeTools, PRE_LOOP_TOOLS);
+	const toolCallGuard = requiredHandler(harness, "tool_call", "runtime guard required");
+	assert.equal(
+		await toolCallGuard({ type: "tool_call", toolCallId: "after-failure", toolName: "bash", input: {} }, harness.ctx),
+		undefined,
+	);
+	await requiredHandler(harness, "agent_end", "continuation hook required")({ type: "agent_end", messages: [] }, harness.ctx);
+	assert.equal(harness.sentMessages.length, 0);
 	const status = await executeTool(harness, "loop_status", {});
 	assert.match(resultText(status), /failed/);
 });

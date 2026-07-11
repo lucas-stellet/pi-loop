@@ -14,6 +14,9 @@ const SUPERVISOR_SYSTEM_PROMPT = [
 	"Track delegated evidence and decide the next supervisor action.",
 ].join(" ");
 
+const LOOP_CONTINUATION_CONTENT =
+	"Continue supervising the objective: decide the next action, delegate work, and complete only with evidence.";
+
 type LoopEventKind = "loop.started" | "loop.paused" | "loop.resumed" | "loop.cleared" | "loop.guardrail_violation";
 
 type LoopEventPayload = Record<string, unknown>;
@@ -40,6 +43,7 @@ export default function piLoop(pi: ExtensionAPI): void {
 	let loopState: LoopState = initialLoopState();
 	let preLoopTools: string[] = [];
 	let guardActive = false;
+	let continuationScheduled = false;
 	const journal = createJournal((customType, data) => pi.appendEntry(customType, data));
 
 	function syncJournalRun(state: LoopState) {
@@ -107,20 +111,44 @@ export default function piLoop(pi: ExtensionAPI): void {
 		recoverPersistedLoopState(ctx);
 	});
 
-	pi.on("before_agent_start", () => {
+	pi.on("agent_start", () => {
+		continuationScheduled = false;
 		if (loopState.state !== "active") {
-			return undefined;
+			return;
 		}
 
 		loopState = { ...loopState, iterationsUsed: (loopState.iterationsUsed ?? 0) + 1 };
 		if (loopState.iterationsUsed >= loopState.maxIterations) {
 			loopState = { ...loopState, state: "budget_limited" };
 			restorePreLoopTools();
-			persist();
+		}
+		persist();
+	});
+
+	pi.on("agent_end", (_event, ctx) => {
+		if (loopState.state !== "active") {
+			return;
+		}
+		if (ctx.hasPendingMessages() || continuationScheduled) {
+			return;
+		}
+
+		continuationScheduled = true;
+		pi.sendMessage(
+			{
+				customType: "loop-continuation",
+				content: LOOP_CONTINUATION_CONTENT,
+				display: true,
+			},
+			{ deliverAs: "followUp", triggerTurn: true },
+		);
+	});
+
+	pi.on("before_agent_start", () => {
+		if (loopState.state !== "active") {
 			return undefined;
 		}
 
-		persist();
 		return { systemPrompt: SUPERVISOR_SYSTEM_PROMPT };
 	});
 
@@ -212,12 +240,17 @@ export default function piLoop(pi: ExtensionAPI): void {
 		parameters: Type.Object({
 			summary: Type.String(),
 		}),
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const summary = params.summary.trim();
-			const error = validateCompletionSummary(loopState.requirements, summary);
+			const error = await validateCompletionSummary(loopState.requirements, summary, {
+				cwd: ctx.cwd,
+				runId: loopState.runId,
+				entries: ctx.sessionManager.getEntries(),
+			});
 			if (error) {
 				if (summaryReportsFailure(summary)) {
 					loopState = { ...loopState, state: "failed" };
+					restorePreLoopTools();
 					persist();
 				}
 				throw new Error(error);
@@ -250,7 +283,10 @@ export default function piLoop(pi: ExtensionAPI): void {
 			task: Type.String(),
 		}),
 		async execute(_toolCallId, params) {
-			pi.appendEntry("loop-delegation", params);
+			if (!loopState.runId) {
+				throw new Error("loop_delegate requires an active loop run.");
+			}
+			pi.appendEntry("loop-delegation", { ...params, runId: loopState.runId });
 			return textResult("Delegation intent recorded.");
 		},
 	});
