@@ -447,7 +447,7 @@ export default function piLoop(
 				throw new Error("loop_delegate requires an approved agent name.");
 			}
 			const origin = { parentRunId, childRunId: createChildRunId() };
-			const publishLifecycle = async (status: "running" | "completed") => {
+			const publishLifecycle = async (status: "running" | "completed" | "failed") => {
 				await appendLoopEvent("delegation.updated", {
 					childId: origin.childRunId,
 					status,
@@ -465,14 +465,12 @@ export default function piLoop(
 			try {
 				const handle = await delegateExecutor.launch({ childRunId: origin.childRunId, cwd: ctx.cwd, task: params.task, metadata });
 				await publishLifecycle("running");
-				void handle.settled.then(() => publishLifecycle("completed")).catch(() => undefined);
+				void handle.settled.then(
+					() => publishLifecycle("completed"),
+					() => publishLifecycle("failed"),
+				).catch(() => undefined);
 			} catch (error) {
-				await appendLoopEvent("delegation.updated", {
-					childId: origin.childRunId,
-					status: "failed",
-					artifactRefs: [],
-				});
-				persist();
+				await publishLifecycle("failed");
 				throw error;
 			}
 			return textResult(`Delegation started: ${origin.childRunId}`, { childRunId: origin.childRunId });

@@ -1995,6 +1995,114 @@ test("loop_delegate publishes the successful child lifecycle without waiting for
 	});
 });
 
+test("loop_delegate publishes one durable runtime failed association after settlement rejection", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		let rejectSettlement!: (error: Error) => void;
+		const childSettled = new Promise<void>((_resolve, reject) => { rejectSettlement = reject; });
+		let releaseFailedSync!: () => void;
+		const failedSyncReleased = new Promise<void>((resolve) => { releaseFailedSync = resolve; });
+		let signalFailedSync!: () => void;
+		const failedSyncEntered = new Promise<void>((resolve) => { signalFailedSync = resolve; });
+		let parentRunId = "";
+		let childRunId = "";
+		let failedMirrors = 0;
+		let snapshotBaseline = -1;
+		const publicationOrder: string[] = [];
+		const launches: Array<{ childRunId: string; cwd: string; task: string }> = [];
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+		const harness = createHarness({
+			cwd,
+			onAppendEntry(customType, data) {
+				const event = data as LoopEvent;
+				const payload = event.payload as { childId?: unknown; status?: unknown } | undefined;
+				if (customType === "loop-event" && event.kind === "delegation.updated" && event.runId === parentRunId
+					&& payload?.childId === childRunId && payload.status === "failed") {
+					failedMirrors += 1;
+					publicationOrder.push("failed loop-event mirror");
+				}
+				if (customType === "loop-state" && snapshotBaseline >= 0) publicationOrder.push("failed loop-state snapshot");
+			},
+		});
+		installLoop(harness, {
+			delegateExecutor: {
+				async launch(request) {
+					launches.push(request);
+					return { pid: process.pid + 1, settled: childSettled };
+				},
+			},
+		});
+
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await withFileHandleMethod("sync", (original) => async function sync(this: FileHandle) {
+				if (childRunId && failedMirrors === 0) {
+					signalFailedSync();
+					await failedSyncReleased;
+					publicationOrder.push("failed sync completion");
+				}
+				return (original as () => Promise<void>).call(this);
+			}, async () => {
+				await executeTool(harness, "loop_start", { objective: "Track one runtime-failed child" });
+				parentRunId = lastLoopState(harness).runId as string;
+				const delegated = await executeTool(harness, "loop_delegate", {
+					name: "delegate",
+					task: "Write one child-owned marker file",
+				});
+				childRunId = (delegated.details as { childRunId?: string } | undefined)?.childRunId ?? "";
+				assert.match(childRunId, /^child-[0-9a-f-]+$/);
+				assert.equal(launches.length, 1);
+				assert.equal(launches[0]?.childRunId, childRunId);
+				assert.equal(launches[0]?.cwd, cwd);
+				assert.equal(launches[0]?.task, "Write one child-owned marker file");
+				assert.deepEqual(loopEvents(harness).filter((event) => event.kind === "delegation.updated").map((event) => event.payload), [
+					{ childId: childRunId, status: "started", artifactRefs: [] },
+					{ childId: childRunId, status: "running", artifactRefs: [] },
+				]);
+
+				snapshotBaseline = harness.appendEntries.filter(({ customType }) => customType === "loop-state").length;
+				const runtimeError = new Error("controlled post-launch settlement failure");
+				rejectSettlement(runtimeError);
+				assert.equal(await Promise.race([
+					failedSyncEntered.then(() => "failed sync"),
+					new Promise<string>((resolve) => { setTimeout(() => resolve("timed out"), 100); }),
+				]), "failed sync", "settlement rejection must publish failed after loop_delegate returned");
+
+				const beforeMirror = (await readFile(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8"))
+					.trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent);
+				const lifecycleBeforeMirror = beforeMirror.filter((event) => event.kind === "delegation.updated");
+				assert.deepEqual(lifecycleBeforeMirror.map((event) => event.runId), [parentRunId, parentRunId, parentRunId]);
+				assert.deepEqual(lifecycleBeforeMirror.map((event) => event.payload), [
+					{ childId: childRunId, status: "started", artifactRefs: [] },
+					{ childId: childRunId, status: "running", artifactRefs: [] },
+					{ childId: childRunId, status: "failed", artifactRefs: [] },
+				]);
+				assert.equal(failedMirrors, 0);
+				assert.equal(harness.appendEntries.filter(({ customType }) => customType === "loop-state").length, snapshotBaseline);
+				releaseFailedSync();
+				while (failedMirrors === 0 || harness.appendEntries.filter(({ customType }) => customType === "loop-state").length < snapshotBaseline + 1) {
+					await new Promise<void>((resolve) => { setImmediate(resolve); });
+				}
+				assert.deepEqual(publicationOrder, ["failed sync completion", "failed loop-event mirror", "failed loop-state snapshot"]);
+				const lifecycle = loopEvents(harness).filter((event) => event.kind === "delegation.updated");
+				assert.deepEqual(lifecycle.map((event) => event.payload), [
+					{ childId: childRunId, status: "started", artifactRefs: [] },
+					{ childId: childRunId, status: "running", artifactRefs: [] },
+					{ childId: childRunId, status: "failed", artifactRefs: [] },
+				]);
+				assert.equal(lifecycle.filter((event) => (event.payload as { status?: unknown }).status === "failed").length, 1);
+				assert.equal(lifecycle.some((event) => (event.payload as { status?: unknown }).status === "completed"), false);
+				assert.deepEqual(lifecycle.map((event) => event.sequence), [...lifecycle.keys()].map((index) => (lifecycle[0]?.sequence as number) + index));
+				await new Promise<void>((resolve) => { setImmediate(resolve); });
+				assert.deepEqual(unhandled, []);
+			});
+		} finally {
+			releaseFailedSync();
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+});
+
 test("before_agent_start injects the latest projected decision context without raw JSONL", async () => {
 	const harness = createHarness();
 	installLoop(harness);
