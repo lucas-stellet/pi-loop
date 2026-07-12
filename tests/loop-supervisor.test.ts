@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 
 import { LOOP_CONTROL_FILES } from "../src/constants.ts";
+import { createChildArtifactStore } from "../src/child-artifacts.ts";
 import { DelegateCancellationError, type DelegateExecutor } from "../src/delegate-executor.ts";
 import { resolveDelegate, type DelegateMetadata, type DelegateResolver } from "../src/delegate-registry.ts";
 import piLoop from "../index.ts";
@@ -1851,8 +1852,9 @@ test("loop_delegate returns a child run id and journals its started association 
 		name: "delegate",
 		task: "Write one child-owned marker file",
 	});
-	const details = delegated.details as { childRunId?: unknown } | undefined;
+	const details = delegated.details as { childRunId?: unknown; artifactRefs?: unknown } | undefined;
 	assert.equal(typeof details?.childRunId, "string");
+	assert.equal(Object.hasOwn(details ?? {}, "artifactRefs"), false, "immediate delegation response must not expose terminal refs");
 	assert.notEqual(details?.childRunId, parentRunId);
 	assert.match(resultText(delegated), new RegExp(details!.childRunId as string));
 
@@ -2026,6 +2028,42 @@ test("loop_delegate publishes the successful child lifecycle without waiting for
 	});
 });
 
+test("loop_status and prompt expose a retained structured ref but never its payload sentinel", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		const sentinel = "STRUCTURED_PAYLOAD_MUST_NEVER_BE_PROJECTED_9e6f";
+		const harness = createHarness({ cwd });
+		installLoop(harness, {
+			delegateExecutor: {
+				async launch(request) {
+					const store = await createChildArtifactStore({ cwd: request.cwd, parentRunId: request.parentRunId, childRunId: request.childRunId });
+					await store.writeStructured(Buffer.from(sentinel, "utf8"));
+					const artifactRefs = await store.finalize();
+					return { pid: process.pid + 1, artifactRefs: Promise.resolve(artifactRefs), settled: Promise.resolve() };
+				},
+			},
+		});
+		await executeTool(harness, "loop_start", { objective: "Project only validated artifact refs" });
+		const parentRunId = lastLoopState(harness).runId as string;
+		const delegated = await executeTool(harness, "loop_delegate", { name: "delegate", task: "retain opaque bytes" });
+		const childRunId = (delegated.details as { childRunId: string }).childRunId;
+		const structuredPath = join(cwd, ".pi", "loop", parentRunId, "children", childRunId, "structured.bin");
+		assert.deepEqual(await readFile(structuredPath), Buffer.from(sentinel, "utf8"));
+		const structuredRef = `children/${childRunId}/structured.bin`;
+		await waitUntil(() => loopEvents(harness).some((event) => event.kind === "delegation.updated"
+			&& (event.payload as { status?: unknown }).status === "completed"), "structured refs were not published");
+		const records = await readFile(join(cwd, ".pi", "loop", parentRunId, "events.jsonl"), "utf8");
+		const mirrored = JSON.stringify(loopEvents(harness));
+		const status = resultText(await executeTool(harness, "loop_status", {}));
+		const prompt = await requiredHandler(harness, "before_agent_start", "prompt hook required")({ type: "before_agent_start" }, harness.ctx);
+		for (const projection of [records, mirrored, status, prompt.systemPrompt]) {
+			assert.equal(projection.includes(sentinel), false);
+			assert.equal(projection.includes(structuredRef), true);
+		}
+		assert.equal(records.includes("validation.completed"), false);
+		assert.equal(records.includes("review.completed"), false);
+	});
+});
+
 test("loop_delegate accepts every fixed artifact shape only after refs settle and projects refs without raw prose", async () => {
 	const shapes = [
 		[],
@@ -2126,7 +2164,11 @@ test("loop_delegate waits for valid refs on completed failed and cancelled settl
 			});
 			await executeTool(harness, "loop_start", { objective: `Await ${outcome.status} refs` });
 			await executeTool(harness, "loop_delegate", { name: "delegate", task: "Retain output pointers" });
-			const refs = [`children/${childRunId}/stdout.bin`, `children/${childRunId}/stderr.bin`];
+			const refs = [
+				`children/${childRunId}/stdout.bin`,
+				`children/${childRunId}/stderr.bin`,
+				`children/${childRunId}/structured.bin`,
+			];
 
 			outcome.settle(settlement);
 			await new Promise<void>((resolve) => setImmediate(resolve));

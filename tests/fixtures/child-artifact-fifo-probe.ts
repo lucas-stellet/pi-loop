@@ -11,6 +11,9 @@ const parentRunId = "parent-opaque-id";
 const childRunId = `${kind}-${operation}`;
 const path = join(cwd, ".pi", "loop", parentRunId, "children", childRunId, `${kind}.bin`);
 const store = await createChildArtifactStore({ cwd, parentRunId, childRunId });
+if (kind === "structured" && operation === "ref") {
+	await store.writeStructured(Buffer.from("already-retained"));
+}
 await rm(path, { force: true });
 execFileSync("/usr/bin/mkfifo", [path]);
 
@@ -18,6 +21,7 @@ try {
 	if (operation === "write") {
 		if (kind === "stdout") await store.writeStdout(Buffer.from("write"));
 		else if (kind === "stderr") await store.writeStderr(Buffer.from("write"));
+		else if (kind === "structured") await store.writeStructured(Buffer.from("write"));
 		else throw new Error("Only streams can be written.");
 	} else if (operation === "finalize") {
 		await store.finalize(kind === "final" ? { final: Buffer.from("final") } : kind === "structured" ? { structured: Buffer.from("structured") } : undefined);

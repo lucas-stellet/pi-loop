@@ -5,6 +5,7 @@ import { once } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
 
@@ -44,6 +45,8 @@ class FakeChild extends EventEmitter {
 	};
 	stdout = new PassThrough();
 	stderr = new PassThrough();
+	structured = new PassThrough();
+	stdio = [this.stdin, this.stdout, this.stderr, this.structured];
 	input: string | undefined;
 	endCallback: (() => void) | undefined;
 	endCalls = 0;
@@ -53,6 +56,14 @@ class FakeChild extends EventEmitter {
 
 	constructor() {
 		super();
+		// End structured once both primary pipes EOF so drains settle even when tests end
+		// stdout/stderr before emitting close (close also ends those pipes).
+		let outputEnds = 0;
+		const endStructured = () => {
+			if (++outputEnds === 2) this.structured.end();
+		};
+		this.stdout.once("end", endStructured);
+		this.stderr.once("end", endStructured);
 		this.on("close", () => {
 			this.stdout.end();
 			this.stderr.end();
@@ -83,6 +94,7 @@ function memoryArtifactStore() {
 	return Promise.resolve({
 		writeStdout: async (_content: Buffer) => {},
 		writeStderr: async (_content: Buffer) => {},
+		writeStructured: async () => {},
 		finalize: async () => [],
 	});
 }
@@ -220,24 +232,23 @@ async function assertPreConfirmationFirstWins(options: {
 test("uses the fixed pi invocation and sends hostile caller text as exact stdin bytes only", async () => {
 	const child = new FakeChild();
 	const { executor, calls } = executorWith(child);
-	const launching = executor.launch(request);
+	const repeatedToolRequest = { ...request, metadata: { ...metadata, tools: ["read", "loop_result", "bash", "loop_result"] } };
+	const launching = executor.launch(repeatedToolRequest);
 	void launching.catch(() => {});
 
 	assert.equal(calls.length, 1);
-	assert.deepEqual(calls[0], {
-		command: "pi",
-		args: [
-			"--mode",
-			"json",
-			"--print",
-			"--no-session",
-			"--tools",
-			"read,bash",
-			"--append-system-prompt",
-			"trusted system prompt",
-		],
-		options: { cwd: request.cwd, shell: false, stdio: ["pipe", "pipe", "pipe"] },
-	});
+	assert.equal(calls[0].command, "pi");
+	assert.deepEqual(calls[0].options, { cwd: request.cwd, shell: false, stdio: ["pipe", "pipe", "pipe", "pipe"] });
+	const args = calls[0].args;
+	const extension = fileURLToPath(new URL("../src/child-result-extension.ts", import.meta.url));
+	assert.equal(args.filter((arg) => arg === "--no-extensions").length, 1);
+	assert.equal(args.filter((arg) => arg === "--extension").length, 1);
+	assert.equal(args[args.indexOf("--extension") + 1], extension);
+	assert.equal(args.includes("--tools"), true);
+	const tools = args[args.indexOf("--tools") + 1]!.split(",");
+	assert.deepEqual(tools, ["read", "bash", "loop_result"]);
+	assert.equal(tools.filter((tool) => tool === "loop_result").length, 1);
+	assert.equal(args.includes("loop_result"), false, "loop_result belongs only in the comma-delimited --tools value");
 	assert.equal(calls[0].command.includes(hostileTask), false);
 	assert.equal(calls[0].args.some((arg) => arg.includes(hostileTask)), false);
 
@@ -327,7 +338,7 @@ test("launches a provider-free real child with a distinct live PID and reaps it"
 		assert.deepEqual(args.slice(0, 4), ["--mode", "json", "--print", "--no-session"]);
 		assert.equal(options.shell, false);
 		actual = realSpawn(process.execPath, ["-e", "process.on('SIGTERM', () => process.exit(0)); process.stdout.write('ready\\n'); process.stdin.resume(); setInterval(() => {}, 1000)"], {
-			stdio: ["pipe", "pipe", "pipe"],
+			stdio: ["pipe", "pipe", "pipe", "pipe"],
 		});
 		ready = once(actual.stdout!, "data");
 		// Install close waiter immediately so close cannot race past cleanup.
@@ -409,7 +420,54 @@ async function writeAll(stream, content) { if (!stream.write(content)) await onc
 			await readFile(join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "stderr.bin")),
 			stderr,
 		);
-		assert.deepEqual(spawnOptions?.stdio, ["pipe", "pipe", "pipe"]);
+		assert.deepEqual(spawnOptions?.stdio, ["pipe", "pipe", "pipe", "pipe"]);
+	} finally {
+		if (actual && actual.exitCode === null && actual.signalCode === null) actual.kill("SIGKILL");
+		if (closed) await withTimeout(closed, 5_000, "timed out waiting to reap real child process");
+		await handle?.settled.catch(() => {});
+		await rm(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("retains exact split fd-3 bytes as a structured artifact", async () => {
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-loop-delegate-structured-"));
+	const parentRunId = "parent-structured";
+	const childRunId = "child-structured";
+	const structured = Buffer.from('{"summary":"FD3_SENTINEL"}', "utf8");
+	let actual: ChildProcess | undefined;
+	let closed: Promise<unknown[]> | undefined;
+	let spawnOptions: SpawnOptions | undefined;
+	const spawn: PiDelegateSpawn = (_command, _args, options) => {
+		spawnOptions = options;
+		actual = realSpawn(
+			process.execPath,
+			[
+				"-e",
+				`const fs = require('node:fs');
+const bytes = Buffer.from(${JSON.stringify(structured.toString("utf8"))});
+fs.writeSync(3, bytes.subarray(0, 11));
+fs.writeSync(3, bytes.subarray(11));`,
+			],
+			{ cwd: tempDir, shell: false, stdio: ["pipe", "pipe", "pipe", "pipe"] },
+		);
+		closed = once(actual, "close");
+		return actual;
+	};
+	const executor = createPiDelegateExecutor({ spawn });
+	let handle: Awaited<ReturnType<typeof executor.launch>> | undefined;
+	try {
+		handle = await executor.launch({ ...request, cwd: tempDir, parentRunId, childRunId });
+		assert.deepEqual(await handle.artifactRefs, [
+			"children/child-structured/stdout.bin",
+			"children/child-structured/stderr.bin",
+			"children/child-structured/structured.bin",
+		]);
+		assert.deepEqual(spawnOptions?.stdio, ["pipe", "pipe", "pipe", "pipe"]);
+		assert.deepEqual(
+			await readFile(join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "structured.bin")),
+			structured,
+		);
+		await handle.settled;
 	} finally {
 		if (actual && actual.exitCode === null && actual.signalCode === null) actual.kill("SIGKILL");
 		if (closed) await withTimeout(closed, 5_000, "timed out waiting to reap real child process");
@@ -461,12 +519,13 @@ test("retains documented Pi final assistant output as a final artifact", async (
 	}
 });
 
-test("retains final output for generic failure and ignores documented-looking stderr", async () => {
+test("retains fd-3 bytes through generic child failure and ignores documented-looking stderr", async () => {
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-loop-delegate-final-failure-"));
 	const child = new FakeChild();
 	const parentRunId = "parent-final-failure";
 	const childRunId = "child-final-failure";
 	const finalText = '{"summary":"opaque only","files":["not-authority.ts"]}';
+	const structured = Buffer.from('{"structured":"generic-failure-sentinel"}', "utf8");
 	const stdout = Buffer.from(`${JSON.stringify({
 		type: "message_end",
 		message: { role: "assistant", content: [{ type: "text", text: finalText }] },
@@ -481,12 +540,14 @@ test("retains final output for generic failure and ignores documented-looking st
 		child.emit("spawn");
 		child.deliver();
 		const handle = await launching;
+		child.structured.end(structured);
 		child.stdout.end(stdout);
 		child.stderr.end(stderr);
 		assert.deepEqual(await handle.artifactRefs, [
 			"children/child-final-failure/stdout.bin",
 			"children/child-final-failure/stderr.bin",
 			"children/child-final-failure/final.bin",
+			"children/child-final-failure/structured.bin",
 		]);
 
 		const runtimeError = new Error("generic post-output failure");
@@ -497,6 +558,37 @@ test("retains final output for generic failure and ignores documented-looking st
 		assert.deepEqual(await readFile(join(directory, "stdout.bin")), stdout);
 		assert.deepEqual(await readFile(join(directory, "stderr.bin")), stderr);
 		assert.deepEqual(await readFile(join(directory, "final.bin")), Buffer.from(finalText));
+		assert.deepEqual(await readFile(join(directory, "structured.bin")), structured);
+	} finally {
+		await rm(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("stdout tool envelopes and JSON-looking final prose do not create structured output without fd 3 bytes", async () => {
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-loop-delegate-no-prose-authority-"));
+	const child = new FakeChild();
+	const parentRunId = "parent-no-prose-authority";
+	const childRunId = "child-no-prose-authority";
+	const payloadSentinel = "PROSE_MUST_NOT_CREATE_STRUCTURED";
+	const stdout = Buffer.from(`${JSON.stringify({ type: "tool_execution_end", toolName: "loop_result", result: { payloadSentinel } })}\n${JSON.stringify({
+		type: "message_end", message: { role: "assistant", content: [{ type: "text", text: JSON.stringify({ payloadSentinel }) }] },
+	})}\n`, "utf8");
+	const executor = createPiDelegateExecutor({ spawn: () => child as unknown as ChildProcess });
+	try {
+		const launching = executor.launch({ ...request, cwd: tempDir, parentRunId, childRunId });
+		child.emit("spawn");
+		child.deliver();
+		const handle = await launching;
+		child.stdout.end(stdout);
+		child.stderr.end();
+		child.emit("close", 0, null);
+		assert.deepEqual(await handle.artifactRefs, [
+			"children/child-no-prose-authority/stdout.bin",
+			"children/child-no-prose-authority/stderr.bin",
+			"children/child-no-prose-authority/final.bin",
+		]);
+		await assert.rejects(readFile(join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "structured.bin")));
+		await handle.settled;
 	} finally {
 		await rm(tempDir, { recursive: true, force: true });
 	}
@@ -512,6 +604,7 @@ test("selected final artifact failures remain fail closed until actual child clo
 		createArtifactStore: async () => ({
 			writeStdout: async () => {},
 			writeStderr: async () => {},
+			writeStructured: async () => {},
 			finalize: async (output) => {
 				finalizeCalls += 1;
 				capturedFinal = output?.final;
@@ -543,6 +636,56 @@ test("selected final artifact failures remain fail closed until actual child clo
 	});
 });
 
+test("backpressures the dedicated structured producer and waits for its drain before finalization", async () => {
+	const child = new FakeChild();
+	const releaseWrite = deferred();
+	const writeEntered = deferred();
+	let structuredWrites = 0;
+	let finalized = false;
+	const executor = createPiDelegateExecutor({
+		spawn: () => child as unknown as ChildProcess,
+		createArtifactStore: async () => ({
+			writeStdout: async () => {},
+			writeStderr: async () => {},
+			writeStructured: async () => {
+				structuredWrites += 1;
+				if (structuredWrites === 1) {
+					writeEntered.resolve();
+					await releaseWrite.promise;
+				}
+			},
+			finalize: async () => { finalized = true; return []; },
+		}),
+	});
+	const launching = executor.launch(request);
+	child.emit("spawn");
+	child.deliver();
+	const handle = await launching;
+	let produced = 0;
+	const chunks = Array.from({ length: 100 }, () => Buffer.alloc(64 * 1024, 0x53));
+	const producer = (async () => {
+		for (const chunk of chunks) {
+			produced += 1;
+			if (!child.structured.write(chunk)) await once(child.structured, "drain");
+		}
+		child.structured.end();
+	})();
+	await writeEntered.promise;
+	await oneTurn();
+	assert.equal(structuredWrites, 1);
+	assert.ok(produced < chunks.length, "fd-3 producer must pause while writeStructured is pending");
+	assert.equal(finalized, false);
+	releaseWrite.resolve();
+	await producer;
+	child.stdout.end();
+	child.stderr.end();
+	child.emit("close", 0, null);
+	await handle.artifactRefs;
+	await handle.settled;
+	assert.equal(structuredWrites, chunks.length);
+	assert.equal(finalized, true);
+});
+
 test("backpressures a bounded producer while an artifact write is pending", async () => {
 	const child = new FakeChild();
 	const firstWrite = deferred();
@@ -564,6 +707,7 @@ test("backpressures a bounded producer while an artifact write is pending", asyn
 					}
 				},
 				writeStderr: async () => {},
+				writeStructured: async () => {},
 				finalize: async () => {
 					finalizeCalls += 1;
 					return refs;
@@ -624,6 +768,7 @@ test("waits for delayed stream writes and one gated finalize before exposing ref
 			writeStderr: async () => {
 				order.push("stderr write end");
 			},
+			writeStructured: async () => {},
 			finalize: async () => {
 				finalizeCalls += 1;
 				order.push("finalize start");
@@ -696,19 +841,23 @@ test("retains exact stream artifacts for a real signal-cancelled child", async (
 		message: { role: "assistant", content: [{ type: "text", text: finalText }] },
 	})}\n`, "utf8");
 	const stderr = Buffer.from([0xfe, 0x00, 0x42]);
+	const structured = Buffer.from('{"structured":"cancel-sentinel"}', "utf8");
 	const stdoutPath = join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "stdout.bin");
 	const stderrPath = join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "stderr.bin");
 	const finalPath = join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "final.bin");
+	const structuredPath = join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "structured.bin");
 	let actual: ChildProcess | undefined;
 	let closed: Promise<unknown[]> | undefined;
 	const spawn: PiDelegateSpawn = (_command, _args, options) => {
 		actual = realSpawn(process.execPath, [
 			"-e",
 			`const { once } = require('node:events');
+const fs = require('node:fs');
 async function writeAll(stream, bytes) { if (!stream.write(Buffer.from(bytes, 'base64'))) await once(stream, 'drain'); }
 (async () => {
 	await writeAll(process.stdout, '${stdout.toString("base64")}');
 	await writeAll(process.stderr, '${stderr.toString("base64")}');
+	fs.writeSync(3, Buffer.from('${structured.toString("base64")}', 'base64'));
 	process.stdin.resume();
 	setInterval(() => {}, 1000);
 })();`,
@@ -721,12 +870,13 @@ async function writeAll(stream, bytes) { if (!stream.write(Buffer.from(bytes, 'b
 	try {
 		handle = await executor.launch({ ...request, cwd: tempDir, parentRunId, childRunId });
 		assert.notEqual(handle.pid, process.pid);
-		await Promise.all([waitForFileBytes(stdoutPath, stdout), waitForFileBytes(stderrPath, stderr)]);
+		await Promise.all([waitForFileBytes(stdoutPath, stdout), waitForFileBytes(stderrPath, stderr), waitForFileBytes(structuredPath, structured)]);
 		process.kill(handle.pid, "SIGTERM");
 		assert.deepEqual(await handle.artifactRefs, [
 			"children/child-cancel/stdout.bin",
 			"children/child-cancel/stderr.bin",
 			"children/child-cancel/final.bin",
+			"children/child-cancel/structured.bin",
 		]);
 		await assert.rejects(handle.settled, (error: unknown) => {
 			assert.ok(error instanceof DelegateCancellationError);
@@ -736,6 +886,7 @@ async function writeAll(stream, bytes) { if (!stream.write(Buffer.from(bytes, 'b
 		assert.deepEqual(await readFile(stdoutPath), stdout);
 		assert.deepEqual(await readFile(stderrPath), stderr);
 		assert.deepEqual(await readFile(finalPath), Buffer.from(finalText));
+		assert.deepEqual(await readFile(structuredPath), structured);
 		await withTimeout(closed!, 5_000, "timed out waiting to reap signal-cancelled child");
 		assert.equal(actual?.signalCode, "SIGTERM");
 	} finally {
@@ -800,8 +951,30 @@ test("rejects launch for pre-confirmation child, stdin, and close failures witho
 	});
 });
 
+test("missing fd 3 fails closed without unhandled rejection or late-event reversal", async () => {
+	const child = new FakeChild();
+	child.stdio[3] = null as unknown as PassThrough;
+	const origin = "Pi child did not provide a piped output stream.";
+	const launching = executorWith(child).executor.launch(request);
+	await withHostFailureObservation(async () => {
+		await assert.rejects(launching, new RegExp(origin));
+		assert.equal(child.killCalls, 1);
+		assert.equal(child.stdout.destroyed, true);
+		assert.equal(child.stderr.destroyed, true);
+		assert.equal(child.stdinDestroyed, true);
+		assert.doesNotThrow(() => {
+			child.emit("spawn");
+			child.deliver();
+			child.emit("close", 1, null);
+			child.emit("error", new Error("late child error"));
+		});
+		await assert.rejects(launching, new RegExp(origin));
+		assert.equal(child.killCalls, 1);
+	});
+});
+
 test("gates post-confirmation output failures on actual child close", async () => {
-	for (const failure of ["stdout readable", "stderr readable", "store write", "store finalize"] as const) {
+	for (const failure of ["stdout readable", "stderr readable", "structured readable", "store write", "structured store write", "store finalize"] as const) {
 		const child = new FakeChild();
 		const originError = new Error(`${failure} failure`);
 		let finalizeCalls = 0;
@@ -812,6 +985,9 @@ test("gates post-confirmation output failures on actual child close", async () =
 					if (failure === "store write") throw originError;
 				},
 				writeStderr: async () => {},
+				writeStructured: async () => {
+					if (failure === "structured store write") throw originError;
+				},
 				finalize: async () => {
 					finalizeCalls += 1;
 					if (failure === "store finalize") throw originError;
@@ -851,7 +1027,9 @@ test("gates post-confirmation output failures on actual child close", async () =
 
 			if (failure === "stdout readable") child.stdout.destroy(originError);
 			if (failure === "stderr readable") child.stderr.destroy(originError);
+			if (failure === "structured readable") child.structured.destroy(originError);
 			if (failure === "store write") child.stdout.write(Buffer.from("write failure"));
+			if (failure === "structured store write") child.structured.write(Buffer.from("structured write failure"));
 			if (failure === "store finalize") {
 				child.stdout.end();
 				child.stderr.end();
@@ -862,6 +1040,7 @@ test("gates post-confirmation output failures on actual child close", async () =
 			assert.equal(child.killCalls, 1, `${failure}: cleanup must run once`);
 			assert.equal(child.stdout.destroyed, true, `${failure}: stdout must be destroyed`);
 			assert.equal(child.stderr.destroyed, true, `${failure}: stderr must be destroyed`);
+			assert.equal(child.structured.destroyed, true, `${failure}: fd 3 must be destroyed`);
 			assert.equal(child.stdinDestroyed, true, `${failure}: stdin must be destroyed`);
 			assert.equal(finalizeCalls, failure === "store finalize" ? 1 : 0);
 

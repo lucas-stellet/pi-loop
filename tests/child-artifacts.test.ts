@@ -289,6 +289,7 @@ test("child artifact store rejects unsafe writable destinations without changing
 		{ kind: "stderr", operation: (store: Awaited<ReturnType<typeof createChildArtifactStore>>) => store.writeStderr(Buffer.from("stderr")) },
 		{ kind: "final", operation: (store: Awaited<ReturnType<typeof createChildArtifactStore>>) => store.finalize({ final: Buffer.from("final") }) },
 		{ kind: "structured", operation: (store: Awaited<ReturnType<typeof createChildArtifactStore>>) => store.finalize({ structured: Buffer.from("structured") }) },
+		{ kind: "structured", operation: (store: Awaited<ReturnType<typeof createChildArtifactStore>>) => store.writeStructured(Buffer.from("structured")) },
 	] as const;
 
 	for (const artifact of artifacts) {
@@ -343,6 +344,32 @@ test("child artifact store rejects unsafe stream paths before exposing final ref
 	}
 });
 
+test("child artifact store rejects unsafe streamed structured destinations before publishing refs", async () => {
+	for (const unsafe of ["symlink", "hardlink", "directory"] as const) {
+		await withCwd(async (cwd) => {
+			const parentRunId = "parent-opaque-id";
+			const childRunId = `structured-ref-${unsafe}`;
+			const store = await createChildArtifactStore({ cwd, parentRunId, childRunId });
+			const path = artifactPath(cwd, parentRunId, childRunId, "structured.bin");
+			await store.writeStructured(Buffer.from("already-retained"));
+			await rm(path, { recursive: true, force: true });
+			if (unsafe === "directory") {
+				await mkdir(path);
+				await assert.rejects(store.finalize());
+				assert.equal((await lstat(path)).isDirectory(), true);
+				return;
+			}
+			const sentinel = join(cwd, `structured-ref-${unsafe}-sentinel`);
+			const bytes = Buffer.from(`structured-ref-${unsafe}-sentinel`);
+			await writeFile(sentinel, bytes);
+			if (unsafe === "symlink") await symlink(sentinel, path);
+			else await link(sentinel, path);
+			await assert.rejects(store.finalize());
+			assert.deepEqual(await readFile(sentinel), bytes);
+		});
+	}
+});
+
 test("child artifact store FIFO operations reject in bounded subprocesses", async () => {
 	await withCwd(async (cwd) => {
 		for (const [kind, operation] of [
@@ -350,10 +377,45 @@ test("child artifact store FIFO operations reject in bounded subprocesses", asyn
 			["stderr", "write"],
 			["final", "finalize"],
 			["structured", "finalize"],
+			["structured", "write"],
 			["stdout", "ref"],
+			["structured", "ref"],
 		] as const) {
 			assert.equal(await runFifoProbe(cwd, kind, operation), "REJECTED");
 		}
+	});
+});
+
+test("child artifact store streams opaque structured bytes, omits zero bytes, rejects mixing, and locks every write after finalization", async () => {
+	await withCwd(async (cwd) => {
+		const parentRunId = "parent-opaque-id";
+		const childRunId = "streamed-structured";
+		const path = artifactPath(cwd, parentRunId, childRunId, "structured.bin");
+		const omitted = await createChildArtifactStore({ cwd, parentRunId, childRunId: "zero-structured" });
+		await omitted.writeStructured(Buffer.alloc(0));
+		assert.deepEqual(await omitted.finalize(), [
+			"children/zero-structured/stdout.bin",
+			"children/zero-structured/stderr.bin",
+		]);
+		await assert.rejects(omitted.writeStructured(Buffer.alloc(0)));
+
+		const stale = await createChildArtifactStore({ cwd, parentRunId, childRunId });
+		await stale.finalize({ structured: Buffer.from("stale") });
+		const store = await createChildArtifactStore({ cwd, parentRunId, childRunId });
+		for (const invalid of ["coerced", new Uint8Array([1]), null]) {
+			await assert.rejects(store.writeStructured(invalid as unknown as Buffer));
+		}
+		await Promise.all([store.writeStructured(Buffer.from([0xff, 0x00])), store.writeStructured(Buffer.from([0x80]))]);
+		assert.deepEqual(await readFile(path), Buffer.from([0xff, 0x00, 0x80]));
+		await assert.rejects(store.finalize({ structured: Buffer.from("replacement") }), /already streaming/);
+		assert.deepEqual(await readFile(path), Buffer.from([0xff, 0x00, 0x80]));
+		assert.deepEqual(await store.finalize(), [
+			"children/streamed-structured/stdout.bin",
+			"children/streamed-structured/stderr.bin",
+			"children/streamed-structured/structured.bin",
+		]);
+		await assert.rejects(store.writeStructured(Buffer.alloc(0)));
+		await assert.rejects(store.writeStructured(Buffer.from("later")));
 	});
 });
 

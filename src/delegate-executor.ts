@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
@@ -52,14 +53,21 @@ export type PiDelegateExecutorOptions = Readonly<{
 	createArtifactStore?: ChildArtifactStoreFactory;
 }>;
 
+const childResultExtensionPath = fileURLToPath(new URL("./child-result-extension.ts", import.meta.url));
+
 function fixedPiArgv(metadata: DelegateMetadata): string[] {
+	// Drop any metadata occurrences of the fixed tool name, then append exactly one allowlist entry.
+	const tools = [...metadata.tools.filter((tool) => tool !== "loop_result"), "loop_result"];
 	return [
 		"--mode",
 		"json",
 		"--print",
 		"--no-session",
+		"--no-extensions",
+		"--extension",
+		childResultExtensionPath,
 		"--tools",
-		metadata.tools.join(","),
+		tools.join(","),
 		"--append-system-prompt",
 		metadata.systemPrompt,
 	];
@@ -109,10 +117,12 @@ export function createPiDelegateExecutor(options: PiDelegateExecutorOptions = {}
 			const child = spawnProcess("pi", fixedPiArgv(request.metadata), {
 				cwd: request.cwd,
 				shell: false,
-				stdio: ["pipe", "pipe", "pipe"],
+				stdio: ["pipe", "pipe", "pipe", "pipe"],
 			});
 			const stdout = child.stdout;
 			const stderr = child.stderr;
+			// stdio[3] is the dedicated structured side channel; type it like stdout for destroy/drain.
+			const structured = (child.stdio[3] ?? null) as typeof child.stdout;
 
 			let cleanupDone = false;
 			const cleanup = (error: Error) => {
@@ -120,18 +130,20 @@ export function createPiDelegateExecutor(options: PiDelegateExecutorOptions = {}
 				cleanupDone = true;
 				stdout?.destroy(error);
 				stderr?.destroy(error);
+				structured?.destroy(error);
 				child.stdin?.destroy?.(error);
 				child.kill();
 			};
 
 			const finalCapture = new PiJsonFinalCapture();
-			// Start both drains promptly so output-before-stdin cannot fill a pipe and deadlock.
+			// Start all drains promptly so output-before-stdin cannot fill a pipe and deadlock.
 			const artifactRefs = Promise.all([
 				drainChildOutput(stdout, store, (artifactStore, chunk) => {
 					finalCapture.write(chunk);
 					return artifactStore.writeStdout(chunk);
 				}),
 				drainChildOutput(stderr, store, (artifactStore, chunk) => artifactStore.writeStderr(chunk)),
+				drainChildOutput(structured, store, (artifactStore, chunk) => artifactStore.writeStructured(chunk)),
 			]).then(async () => {
 				const final = finalCapture.finish();
 				return (await store).finalize(final === undefined ? {} : { final });

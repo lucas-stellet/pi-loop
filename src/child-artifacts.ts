@@ -16,6 +16,7 @@ type ArtifactKind = keyof typeof ARTIFACT_FILENAMES;
 export type ChildArtifactStore = {
 	writeStdout(content: Buffer): Promise<void>;
 	writeStderr(content: Buffer): Promise<void>;
+	writeStructured(content: Buffer): Promise<void>;
 	finalize(output?: { final?: Buffer; structured?: Buffer }): Promise<string[]>;
 };
 
@@ -162,6 +163,7 @@ export async function createChildArtifactStore({
 	assertOpaqueId(childRunId);
 	const directory = await ensureDirectory(cwd, parentRunId, childRunId);
 	let finalized = false;
+	let structuredStreaming = false;
 	let operations = Promise.resolve();
 
 	const assertWritable = (): void => {
@@ -185,6 +187,20 @@ export async function createChildArtifactStore({
 		});
 	};
 
+	const writeStructured = async (content: Buffer): Promise<void> => {
+		if (!Buffer.isBuffer(content)) throw new Error("Child artifact content must be a Buffer.");
+		return enqueue(async () => {
+			assertWritable();
+			if (content.length === 0) return;
+			if (structuredStreaming) {
+				await appendArtifact(artifactPath(directory, "structured"), content);
+			} else {
+				await replaceArtifact(artifactPath(directory, "structured"), content);
+				structuredStreaming = true;
+			}
+		});
+	};
+
 	// Always-present stream artifacts exist as empty regular files once the store is created.
 	await appendArtifact(artifactPath(directory, "stdout"), Buffer.alloc(0));
 	await appendArtifact(artifactPath(directory, "stderr"), Buffer.alloc(0));
@@ -192,12 +208,16 @@ export async function createChildArtifactStore({
 	return {
 		writeStdout: (content) => writeStream("stdout", content),
 		writeStderr: (content) => writeStream("stderr", content),
+		writeStructured,
 		finalize: async (output = {}) => {
 			// Validate the whole container and present fields before any optional write is queued.
 			const optional = readFinalizeBuffers(output);
 
 			return enqueue(async () => {
 				assertWritable();
+				if (structuredStreaming && optional.structured !== undefined) {
+					throw new Error("Child structured artifact is already streaming.");
+				}
 				const kinds: ArtifactKind[] = ["stdout", "stderr"];
 				if (optional.final !== undefined) {
 					await replaceArtifact(artifactPath(directory, "final"), optional.final);
@@ -205,6 +225,8 @@ export async function createChildArtifactStore({
 				}
 				if (optional.structured !== undefined) {
 					await replaceArtifact(artifactPath(directory, "structured"), optional.structured);
+					kinds.push("structured");
+				} else if (structuredStreaming) {
 					kinds.push("structured");
 				}
 
