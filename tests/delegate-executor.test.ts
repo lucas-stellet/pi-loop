@@ -418,6 +418,131 @@ async function writeAll(stream, content) { if (!stream.write(content)) await onc
 	}
 });
 
+test("retains documented Pi final assistant output as a final artifact", async () => {
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-loop-delegate-final-"));
+	const child = new FakeChild();
+	const parentRunId = "parent-final";
+	const childRunId = "child-final";
+	const stdout = Buffer.from(
+		'{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"FINAL_SENTINEL"}]}}\n',
+		"utf8",
+	);
+	const executor = createPiDelegateExecutor({
+		spawn: () => child as unknown as ChildProcess,
+	});
+	try {
+		const launching = executor.launch({ ...request, cwd: tempDir, parentRunId, childRunId });
+		child.emit("spawn");
+		child.deliver();
+		const handle = await launching;
+
+		child.stdout.write(stdout.subarray(0, 23));
+		child.stdout.end(stdout.subarray(23));
+		child.stderr.end();
+		child.emit("close", 0, null);
+
+		const artifactRefs = await handle.artifactRefs;
+		assert.deepEqual(
+			await readFile(join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "stdout.bin")),
+			stdout,
+		);
+		assert.deepEqual(artifactRefs, [
+			"children/child-final/stdout.bin",
+			"children/child-final/stderr.bin",
+			"children/child-final/final.bin",
+		]);
+		assert.deepEqual(
+			await readFile(join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "final.bin")),
+			Buffer.from("FINAL_SENTINEL", "utf8"),
+		);
+		await handle.settled;
+	} finally {
+		await rm(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("retains final output for generic failure and ignores documented-looking stderr", async () => {
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-loop-delegate-final-failure-"));
+	const child = new FakeChild();
+	const parentRunId = "parent-final-failure";
+	const childRunId = "child-final-failure";
+	const finalText = '{"summary":"opaque only","files":["not-authority.ts"]}';
+	const stdout = Buffer.from(`${JSON.stringify({
+		type: "message_end",
+		message: { role: "assistant", content: [{ type: "text", text: finalText }] },
+	})}\n`);
+	const stderr = Buffer.from(`${JSON.stringify({
+		type: "message_end",
+		message: { role: "assistant", content: [{ type: "text", text: "STDERR_MUST_NOT_WIN" }] },
+	})}\n`);
+	const executor = createPiDelegateExecutor({ spawn: () => child as unknown as ChildProcess });
+	try {
+		const launching = executor.launch({ ...request, cwd: tempDir, parentRunId, childRunId });
+		child.emit("spawn");
+		child.deliver();
+		const handle = await launching;
+		child.stdout.end(stdout);
+		child.stderr.end(stderr);
+		assert.deepEqual(await handle.artifactRefs, [
+			"children/child-final-failure/stdout.bin",
+			"children/child-final-failure/stderr.bin",
+			"children/child-final-failure/final.bin",
+		]);
+
+		const runtimeError = new Error("generic post-output failure");
+		child.emit("error", runtimeError);
+		child.emit("close", 1, null);
+		await assert.rejects(handle.settled, (error: unknown) => error === runtimeError);
+		const directory = join(tempDir, ".pi", "loop", parentRunId, "children", childRunId);
+		assert.deepEqual(await readFile(join(directory, "stdout.bin")), stdout);
+		assert.deepEqual(await readFile(join(directory, "stderr.bin")), stderr);
+		assert.deepEqual(await readFile(join(directory, "final.bin")), Buffer.from(finalText));
+	} finally {
+		await rm(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("selected final artifact failures remain fail closed until actual child close", async () => {
+	const child = new FakeChild();
+	const originError = new Error("final artifact unavailable");
+	let finalizeCalls = 0;
+	let capturedFinal: Buffer | undefined;
+	const executor = createPiDelegateExecutor({
+		spawn: () => child as unknown as ChildProcess,
+		createArtifactStore: async () => ({
+			writeStdout: async () => {},
+			writeStderr: async () => {},
+			finalize: async (output) => {
+				finalizeCalls += 1;
+				capturedFinal = output?.final;
+				throw originError;
+			},
+		}),
+	});
+	const launching = executor.launch(request);
+	child.emit("spawn");
+	child.deliver();
+	const handle = await launching;
+	const line = Buffer.from(`${JSON.stringify({
+		type: "message_end",
+		message: { role: "assistant", content: [{ type: "text", text: "selected before failure" }] },
+	})}\n`);
+
+	await withHostFailureObservation(async () => {
+		child.stdout.end(line);
+		child.stderr.end();
+		await assert.rejects(handle.artifactRefs, (error: unknown) => error === originError);
+		assert.equal(finalizeCalls, 1);
+		assert.deepEqual(capturedFinal, Buffer.from("selected before failure"));
+		let settled = false;
+		void handle.settled.catch(() => { settled = true; });
+		await oneTurn();
+		assert.equal(settled, false);
+		child.emit("close", null, "SIGTERM");
+		await assert.rejects(handle.settled, (error: unknown) => error === originError);
+	});
+});
+
 test("backpressures a bounded producer while an artifact write is pending", async () => {
 	const child = new FakeChild();
 	const firstWrite = deferred();
@@ -565,10 +690,15 @@ test("retains exact stream artifacts for a real signal-cancelled child", async (
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-loop-delegate-cancel-artifacts-"));
 	const parentRunId = "parent-cancel";
 	const childRunId = "child-cancel";
-	const stdout = Buffer.from([0x00, 0xff, 0x80, 0x41]);
+	const finalText = "cancelled final sentinel";
+	const stdout = Buffer.from(`${JSON.stringify({
+		type: "message_end",
+		message: { role: "assistant", content: [{ type: "text", text: finalText }] },
+	})}\n`, "utf8");
 	const stderr = Buffer.from([0xfe, 0x00, 0x42]);
 	const stdoutPath = join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "stdout.bin");
 	const stderrPath = join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "stderr.bin");
+	const finalPath = join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "final.bin");
 	let actual: ChildProcess | undefined;
 	let closed: Promise<unknown[]> | undefined;
 	const spawn: PiDelegateSpawn = (_command, _args, options) => {
@@ -596,6 +726,7 @@ async function writeAll(stream, bytes) { if (!stream.write(Buffer.from(bytes, 'b
 		assert.deepEqual(await handle.artifactRefs, [
 			"children/child-cancel/stdout.bin",
 			"children/child-cancel/stderr.bin",
+			"children/child-cancel/final.bin",
 		]);
 		await assert.rejects(handle.settled, (error: unknown) => {
 			assert.ok(error instanceof DelegateCancellationError);
@@ -604,6 +735,7 @@ async function writeAll(stream, bytes) { if (!stream.write(Buffer.from(bytes, 'b
 		});
 		assert.deepEqual(await readFile(stdoutPath), stdout);
 		assert.deepEqual(await readFile(stderrPath), stderr);
+		assert.deepEqual(await readFile(finalPath), Buffer.from(finalText));
 		await withTimeout(closed!, 5_000, "timed out waiting to reap signal-cancelled child");
 		assert.equal(actual?.signalCode, "SIGTERM");
 	} finally {

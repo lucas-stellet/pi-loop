@@ -4,6 +4,7 @@ import { pipeline } from "node:stream/promises";
 
 import { createChildArtifactStore, type ChildArtifactStore } from "./child-artifacts.ts";
 import type { DelegateMetadata } from "./delegate-registry.ts";
+import { PiJsonFinalCapture } from "./pi-json-final-capture.ts";
 
 export type DelegateLaunchRequest = Readonly<{
 	parentRunId: string;
@@ -123,11 +124,18 @@ export function createPiDelegateExecutor(options: PiDelegateExecutorOptions = {}
 				child.kill();
 			};
 
+			const finalCapture = new PiJsonFinalCapture();
 			// Start both drains promptly so output-before-stdin cannot fill a pipe and deadlock.
 			const artifactRefs = Promise.all([
-				drainChildOutput(stdout, store, (artifactStore, chunk) => artifactStore.writeStdout(chunk)),
+				drainChildOutput(stdout, store, (artifactStore, chunk) => {
+					finalCapture.write(chunk);
+					return artifactStore.writeStdout(chunk);
+				}),
 				drainChildOutput(stderr, store, (artifactStore, chunk) => artifactStore.writeStderr(chunk)),
-			]).then(async () => (await store).finalize());
+			]).then(async () => {
+				const final = finalCapture.finish();
+				return (await store).finalize(final === undefined ? {} : { final });
+			});
 			let failLaunch: ((error: Error) => void) | undefined;
 			let firstFailure: Error | undefined;
 			// Store/drain failures must tear down sibling resources; observe so discarded handles stay quiet.

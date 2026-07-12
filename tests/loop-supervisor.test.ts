@@ -2080,6 +2080,15 @@ test("loop_delegate accepts every fixed artifact shape only after refs settle an
 			assert.deepEqual(mirrored.map((event) => event.payload), expectedPayloads);
 			assert.equal(JSON.stringify(canonical).includes("mutated-after-publication"), false);
 			assert.equal(JSON.stringify(mirrored).includes("mutated-after-publication"), false);
+			assert.equal(JSON.stringify(records).includes(rawProse), false);
+			assert.equal(JSON.stringify(mirrored).includes(rawProse), false);
+			assert.equal(records.some((event) => [
+				"workspace.changed",
+				"validation.completed",
+				"review.completed",
+				"nit.recorded",
+				"blocker.raised",
+			].includes(event.kind as string)), false);
 
 			const status = resultText(await executeTool(harness, "loop_status", {}));
 			const prompt = await requiredHandler(harness, "before_agent_start", "prompt hook required")({ type: "before_agent_start" }, harness.ctx);
