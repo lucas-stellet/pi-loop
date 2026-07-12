@@ -107,6 +107,29 @@ async function waitFor(condition: () => boolean, message: string): Promise<void>
 	throw new Error(message);
 }
 
+function deferred<T = void>(): {
+	promise: Promise<T>;
+	resolve: (value: T) => void;
+} {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((done) => {
+		resolve = done;
+	});
+	return { promise, resolve };
+}
+
+async function waitForFileBytes(path: string, expected: Buffer): Promise<void> {
+	for (let attempt = 0; attempt < 500; attempt += 1) {
+		try {
+			if ((await readFile(path)).equals(expected)) return;
+		} catch {
+			// The fixed artifact may not exist until the child store is ready.
+		}
+		await new Promise<void>((resolve) => setTimeout(resolve, 10));
+	}
+	throw new Error(`Timed out waiting for exact artifact bytes at ${path}.`);
+}
+
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
 	return new Promise<T>((resolve, reject) => {
 		const timer = setTimeout(() => reject(new Error(message)), ms);
@@ -395,30 +418,199 @@ async function writeAll(stream, content) { if (!stream.write(content)) await onc
 	}
 });
 
-test("rejects a real signal-terminated child with the typed cancellation outcome", async () => {
+test("backpressures a bounded producer while an artifact write is pending", async () => {
+	const child = new FakeChild();
+	const firstWrite = deferred();
+	const firstWriteEntered = deferred();
+	const factoryCalls: unknown[] = [];
+	const stdoutWrites: Buffer[] = [];
+	let finalizeCalls = 0;
+	const refs = ["children/run-1/stdout.bin", "children/run-1/stderr.bin"];
+	const executor = createPiDelegateExecutor({
+		spawn: () => child as unknown as ChildProcess,
+		createArtifactStore: async (input) => {
+			factoryCalls.push(input);
+			return {
+				writeStdout: async (content) => {
+					stdoutWrites.push(Buffer.from(content));
+					if (stdoutWrites.length === 1) {
+						firstWriteEntered.resolve();
+						await firstWrite.promise;
+					}
+				},
+				writeStderr: async () => {},
+				finalize: async () => {
+					finalizeCalls += 1;
+					return refs;
+				},
+			};
+		},
+	});
+	const launching = executor.launch(request);
+	child.emit("spawn");
+	child.deliver();
+	const handle = await launching;
+
+	let produced = 0;
+	const chunks = Array.from({ length: 100 }, () => Buffer.alloc(64 * 1024, 0xa5));
+	const producer = (async () => {
+		for (const chunk of chunks) {
+			produced += 1;
+			if (!child.stdout.write(chunk)) await once(child.stdout, "drain");
+		}
+		child.stdout.end();
+	})();
+	child.stderr.end();
+	await firstWriteEntered.promise;
+	await oneTurn();
+	assert.equal(stdoutWrites.length, 1, "the sink must not invoke a second store write while the first is pending");
+	assert.ok(produced < chunks.length, "a backpressure-aware producer must pause instead of freely emitting all output");
+	assert.equal(finalizeCalls, 0);
+	assert.deepEqual(factoryCalls, [{ cwd: request.cwd, parentRunId: request.parentRunId, childRunId: request.childRunId }]);
+	assert.doesNotMatch(JSON.stringify(factoryCalls), /leading|traversal|danger/);
+
+	firstWrite.resolve();
+	await producer;
+	child.emit("close", 0, null);
+	assert.deepEqual(await handle.artifactRefs, refs);
+	await handle.settled;
+	assert.equal(stdoutWrites.length, chunks.length);
+	assert.equal(finalizeCalls, 1);
+});
+
+test("waits for delayed stream writes and one gated finalize before exposing refs or settlement", async () => {
+	const child = new FakeChild();
+	const writeEntered = deferred();
+	const releaseWrite = deferred();
+	const finalizeEntered = deferred();
+	const releaseFinalize = deferred();
+	const order: string[] = [];
+	const refs = ["children/run-1/stdout.bin", "children/run-1/stderr.bin"];
+	let finalizeCalls = 0;
+	const executor = createPiDelegateExecutor({
+		spawn: () => child as unknown as ChildProcess,
+		createArtifactStore: async () => ({
+			writeStdout: async () => {
+				order.push("stdout write start");
+				writeEntered.resolve();
+				await releaseWrite.promise;
+				order.push("stdout write end");
+			},
+			writeStderr: async () => {
+				order.push("stderr write end");
+			},
+			finalize: async () => {
+				finalizeCalls += 1;
+				order.push("finalize start");
+				finalizeEntered.resolve();
+				await releaseFinalize.promise;
+				order.push("finalize end");
+				return refs;
+			},
+		}),
+	});
+	const launching = executor.launch(request);
+	child.emit("spawn");
+	child.deliver();
+	const handle = await launching;
+	let refsOutcome: "resolved" | "rejected" | undefined;
+	let settledOutcome: "resolved" | "rejected" | undefined;
+	let refsCallbacks = 0;
+	let settledCallbacks = 0;
+	void handle.artifactRefs.then(
+		() => { refsCallbacks += 1; refsOutcome = "resolved"; },
+		() => { refsCallbacks += 1; refsOutcome = "rejected"; },
+	);
+	void handle.settled.then(
+		() => { settledCallbacks += 1; settledOutcome = "resolved"; },
+		() => { settledCallbacks += 1; settledOutcome = "rejected"; },
+	);
+
+	child.stdout.end(Buffer.from("stdout"));
+	child.stderr.end(Buffer.from("stderr"));
+	await writeEntered.promise;
+	child.emit("close", 0, null);
+	await oneTurn();
+	assert.equal(refsOutcome, undefined);
+	assert.equal(settledOutcome, undefined);
+	assert.equal(finalizeCalls, 0);
+
+	releaseWrite.resolve();
+	await finalizeEntered.promise;
+	assert.equal(finalizeCalls, 1);
+	assert.ok(order.indexOf("finalize start") > order.indexOf("stdout write end"));
+	assert.ok(order.indexOf("finalize start") > order.indexOf("stderr write end"));
+	assert.equal(refsOutcome, undefined);
+	assert.equal(settledOutcome, undefined);
+
+	releaseFinalize.resolve();
+	assert.deepEqual(await handle.artifactRefs, refs);
+	await handle.settled;
+	assert.deepEqual(order.at(-1), "finalize end");
+	assert.equal(refsCallbacks, 1);
+	assert.equal(settledCallbacks, 1);
+
+	child.emit("spawn");
+	child.deliver();
+	child.stdout.end();
+	child.stderr.end();
+	child.emit("close", 0, null);
+	await oneTurn();
+	assert.equal(finalizeCalls, 1);
+	assert.equal(refsCallbacks, 1);
+	assert.equal(settledCallbacks, 1);
+});
+
+test("retains exact stream artifacts for a real signal-cancelled child", async () => {
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-loop-delegate-cancel-artifacts-"));
+	const parentRunId = "parent-cancel";
+	const childRunId = "child-cancel";
+	const stdout = Buffer.from([0x00, 0xff, 0x80, 0x41]);
+	const stderr = Buffer.from([0xfe, 0x00, 0x42]);
+	const stdoutPath = join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "stdout.bin");
+	const stderrPath = join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "stderr.bin");
 	let actual: ChildProcess | undefined;
 	let closed: Promise<unknown[]> | undefined;
-	const spawn: PiDelegateSpawn = () => {
-		actual = realSpawn(process.execPath, ["-e", "process.stdin.resume(); setInterval(() => {}, 1000)"], {
-			stdio: ["pipe", "pipe", "pipe"],
-		});
+	const spawn: PiDelegateSpawn = (_command, _args, options) => {
+		actual = realSpawn(process.execPath, [
+			"-e",
+			`const { once } = require('node:events');
+async function writeAll(stream, bytes) { if (!stream.write(Buffer.from(bytes, 'base64'))) await once(stream, 'drain'); }
+(async () => {
+	await writeAll(process.stdout, '${stdout.toString("base64")}');
+	await writeAll(process.stderr, '${stderr.toString("base64")}');
+	process.stdin.resume();
+	setInterval(() => {}, 1000);
+})();`,
+		], { cwd: tempDir, shell: false, stdio: options.stdio });
 		closed = once(actual, "close");
 		return actual;
 	};
-	const executor = createPiDelegateExecutor({ spawn, createArtifactStore: memoryArtifactStore });
+	const executor = createPiDelegateExecutor({ spawn });
 	let handle: Awaited<ReturnType<typeof executor.launch>> | undefined;
 	try {
-		handle = await executor.launch(request);
+		handle = await executor.launch({ ...request, cwd: tempDir, parentRunId, childRunId });
 		assert.notEqual(handle.pid, process.pid);
+		await Promise.all([waitForFileBytes(stdoutPath, stdout), waitForFileBytes(stderrPath, stderr)]);
 		process.kill(handle.pid, "SIGTERM");
+		assert.deepEqual(await handle.artifactRefs, [
+			"children/child-cancel/stdout.bin",
+			"children/child-cancel/stderr.bin",
+		]);
 		await assert.rejects(handle.settled, (error: unknown) => {
 			assert.ok(error instanceof DelegateCancellationError);
+			assert.equal(error.signal, "SIGTERM");
 			return true;
 		});
+		assert.deepEqual(await readFile(stdoutPath), stdout);
+		assert.deepEqual(await readFile(stderrPath), stderr);
+		await withTimeout(closed!, 5_000, "timed out waiting to reap signal-cancelled child");
+		assert.equal(actual?.signalCode, "SIGTERM");
 	} finally {
-		if (actual && actual.exitCode === null && actual.signalCode === null) actual.kill("SIGTERM");
-		if (closed) await withTimeout(closed, 5_000, "timed out waiting to reap signal-terminated child");
+		if (actual && actual.exitCode === null && actual.signalCode === null) actual.kill("SIGKILL");
+		if (closed) await withTimeout(closed, 5_000, "timed out waiting to reap signal-cancelled child");
 		await handle?.settled.catch(() => {});
+		await rm(tempDir, { recursive: true, force: true });
 	}
 });
 

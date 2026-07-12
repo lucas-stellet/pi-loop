@@ -1864,7 +1864,8 @@ test("loop_delegate publishes the successful child lifecycle without waiting for
 		let completedMirrors = 0;
 		let snapshotBaseline = -1;
 		const completedPublicationOrder: string[] = [];
-		const launches: Array<{ childRunId: string; cwd: string; task: string }> = [];
+		const hiddenArtifactRef = "children/hidden/RAW_CHILD_OUTPUT_SENTINEL_R07B2.bin";
+		const launches: Array<{ parentRunId: string; childRunId: string; cwd: string; task: string }> = [];
 		const harness = createHarness({
 			cwd,
 			onAppendEntry(customType, data) {
@@ -1890,7 +1891,7 @@ test("loop_delegate publishes the successful child lifecycle without waiting for
 					launches.push(request);
 					signalLaunch();
 					await launchReleased;
-					return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: childSettled };
+					return { pid: process.pid + 1, artifactRefs: Promise.resolve([hiddenArtifactRef]), settled: childSettled };
 				},
 			},
 		});
@@ -1930,9 +1931,11 @@ test("loop_delegate publishes the successful child lifecycle without waiting for
 
 					childRunId = (result?.details as { childRunId?: string } | undefined)?.childRunId ?? "";
 					assert.match(childRunId, /^child-[0-9a-f-]+$/);
+					assert.equal(launches[0]?.parentRunId, parentRunId);
 					assert.equal(launches[0]?.childRunId, childRunId);
 					assert.equal(launches[0]?.cwd, cwd);
 					assert.equal(launches[0]?.task, "Write one child-owned marker file");
+					assert.equal(JSON.stringify(result).includes(hiddenArtifactRef), false);
 					assert.equal(legacyDelegation?.runId, parentRunId);
 					assert.equal(legacyDelegation?.childRunId, childRunId);
 					assert.equal(runningMirrorSawDisk, true);
@@ -1970,6 +1973,8 @@ test("loop_delegate publishes the successful child lifecycle without waiting for
 					const mirroredLifecycle = loopEvents(harness).filter((event) => event.kind === "delegation.updated");
 					assert.deepEqual(mirroredLifecycle.map((event) => event.runId), [parentRunId, parentRunId, parentRunId]);
 					assert.deepEqual(mirroredLifecycle.map((event) => event.payload), expectedPayloads);
+					assert.equal(JSON.stringify(lifecycle).includes(hiddenArtifactRef), false);
+					assert.equal(JSON.stringify(mirroredLifecycle).includes(hiddenArtifactRef), false);
 					assert.deepEqual(lifecycle.map((event) => event.sequence), [...lifecycle.keys()].map((index) => (lifecycle[0]?.sequence as number) + index));
 					await executeTool(harness, "loop_status", {});
 					await Promise.resolve();
@@ -2223,6 +2228,8 @@ test("clear/restart callback isolation retains late delegated terminals with the
 				resolveSettlement = resolve;
 				rejectSettlement = reject;
 			});
+			const hiddenArtifactRef = `children/hidden/RAW_CHILD_OUTPUT_${outcome.status}_R07B2.bin`;
+			let launchedRequest: Parameters<DelegateExecutor["launch"]>[0] | undefined;
 			let aTerminalMirrors = 0;
 			const unhandled: unknown[] = [];
 			const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
@@ -2236,8 +2243,9 @@ test("clear/restart callback isolation retains late delegated terminals with the
 			});
 			installLoop(harness, {
 				delegateExecutor: {
-					async launch() {
-						return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled };
+					async launch(request) {
+						launchedRequest = request;
+						return { pid: process.pid + 1, artifactRefs: Promise.resolve([hiddenArtifactRef]), settled };
 					},
 				},
 			});
@@ -2248,6 +2256,8 @@ test("clear/restart callback isolation retains late delegated terminals with the
 				const delegated = await executeTool(harness, "loop_delegate", { name: "delegate", task: "Settle after restart" });
 				const childId = (delegated.details as { childRunId?: string } | undefined)?.childRunId ?? "";
 				assert.match(childId, /^child-[0-9a-f-]+$/);
+				assert.equal(launchedRequest?.parentRunId, runA);
+				assert.equal(JSON.stringify(delegated).includes(hiddenArtifactRef), false);
 				const beforeClear = (await readFile(join(cwd, ".pi", "loop", runA, "events.jsonl"), "utf8"))
 					.trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent)
 					.filter((event) => event.kind === "delegation.updated");
@@ -2257,6 +2267,7 @@ test("clear/restart callback isolation retains late delegated terminals with the
 				await executeTool(harness, "loop_start", { objective: "Run B stays current", maxIterations: 3 });
 				const runB = lastLoopState(harness).runId as string;
 				assert.notEqual(runB, runA);
+				assert.equal(launchedRequest?.parentRunId, runA);
 				const snapshotsBeforePublications = harness.appendEntries.filter((entry) => entry.customType === "loop-state").length;
 
 				outcome.settle(resolveSettlement, rejectSettlement);
@@ -2271,8 +2282,11 @@ test("clear/restart callback isolation retains late delegated terminals with the
 				assert.deepEqual(aLifecycle.map((event) => (event.payload as { status?: unknown }).status), ["started", "running", outcome.status]);
 				assert.deepEqual(aLifecycle.map((event) => event.runId), [runA, runA, runA]);
 				assert.deepEqual(aLifecycle.map((event) => (event.payload as { childId?: unknown }).childId), [childId, childId, childId]);
+				assert.deepEqual(aLifecycle.map((event) => (event.payload as { artifactRefs?: unknown }).artifactRefs), [[], [], []]);
+				assert.equal(JSON.stringify(aEvents).includes(hiddenArtifactRef), false);
 				assert.deepEqual(aEvents.map((event) => event.sequence), aEvents.map((_event, index) => index + 1));
 				assert.equal(bEvents.some((event) => JSON.stringify(event).includes(childId)), false);
+				assert.equal(JSON.stringify(bEvents).includes(hiddenArtifactRef), false);
 				assert.ok(bEvents.some((event) => event.kind === "loop.iteration"));
 				assert.deepEqual(bEvents.map((event) => event.sequence), bEvents.map((_event, index) => index + 1));
 
@@ -2286,8 +2300,10 @@ test("clear/restart callback isolation retains late delegated terminals with the
 
 				const status = await executeTool(harness, "loop_status", {});
 				assert.doesNotMatch(resultText(status), new RegExp(childId));
+				assert.equal(resultText(status).includes(hiddenArtifactRef), false);
 				const prompt = await requiredHandler(harness, "before_agent_start", "prompt hook required")({ type: "before_agent_start" }, harness.ctx);
 				assert.doesNotMatch(prompt.systemPrompt, new RegExp(childId));
+				assert.equal(prompt.systemPrompt.includes(hiddenArtifactRef), false);
 				await requiredHandler(harness, "session_compact", "recovery hook required")(sessionCompactEvent(), harness.ctx);
 				assert.equal(lastLoopState(harness).runId, runB);
 				await requiredHandler(harness, "agent_start", "B iteration hook required")({ type: "agent_start" }, harness.ctx);
