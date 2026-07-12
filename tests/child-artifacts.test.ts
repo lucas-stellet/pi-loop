@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import test from "node:test";
 
 import { createChildArtifactStore } from "../src/child-artifacts.ts";
@@ -17,6 +17,36 @@ async function withCwd(run: (cwd: string) => Promise<void>): Promise<void> {
 
 function artifactPath(cwd: string, parentRunId: string, childRunId: string, filename: string): string {
 	return join(cwd, ".pi", "loop", parentRunId, "children", childRunId, filename);
+}
+
+const managedSegments = [".pi", "loop", "parent-opaque-id", "children", "child-opaque-id"];
+
+function managedPath(cwd: string, position: number): string {
+	return join(cwd, ...managedSegments.slice(0, position + 1));
+}
+
+async function createRealAncestors(cwd: string, position: number): Promise<void> {
+	if (position > 0) await mkdir(managedPath(cwd, position - 1), { recursive: true });
+}
+
+type TreeEntry = { type: "directory" } | { type: "file"; bytes: Buffer } | { type: "symlink" } | { type: "other" };
+
+async function snapshotTree(root: string): Promise<Record<string, TreeEntry>> {
+	const entries: Record<string, TreeEntry> = {};
+	const visit = async (directory: string): Promise<void> => {
+		for (const entry of await readdir(directory, { withFileTypes: true })) {
+			const path = join(directory, entry.name);
+			const key = relative(root, path);
+			if (entry.isDirectory()) {
+				entries[key] = { type: "directory" };
+				await visit(path);
+			} else if (entry.isFile()) entries[key] = { type: "file", bytes: await readFile(path) };
+			else if (entry.isSymbolicLink()) entries[key] = { type: "symlink" };
+			else entries[key] = { type: "other" };
+		}
+	};
+	await visit(root);
+	return entries;
 }
 
 test("child artifact store validates opaque IDs before creating managed paths", async () => {
@@ -69,6 +99,85 @@ test("child artifact store rejects a symlinked managed ancestor before creating 
 		await rm(cwd, { recursive: true, force: true });
 		await rm(outside, { recursive: true, force: true });
 	}
+});
+
+test("child artifact store rejects symlinked managed components without mutating their targets", async () => {
+	for (const targetType of ["outside", "inside", "dangling"] as const) {
+		for (const [position, segment] of managedSegments.entries()) {
+			const cwd = await mkdtemp(join(tmpdir(), "pi-loop-child-artifacts-"));
+			const outside = await mkdtemp(join(tmpdir(), "pi-loop-child-artifacts-outside-"));
+			try {
+				await createRealAncestors(cwd, position);
+				const target = targetType === "outside" ? outside : join(cwd, `${targetType}-target-${position}`);
+				if (targetType === "inside") await mkdir(target);
+				if (targetType === "outside" && position === managedSegments.length - 1) {
+					await writeFile(join(target, "stdout.bin"), "outside stdout sentinel");
+					await writeFile(join(target, "stderr.bin"), "outside stderr sentinel");
+				}
+				const before = targetType === "dangling" ? undefined : await snapshotTree(target);
+				await symlink(target, managedPath(cwd, position));
+
+				await assert.rejects(
+					createChildArtifactStore({ cwd, parentRunId: managedSegments[2], childRunId: managedSegments[4] }),
+					`${targetType} symlink at ${segment} must be rejected`,
+				);
+				if (targetType === "dangling") await assert.rejects(readdir(target));
+				else assert.deepEqual(await snapshotTree(target), before);
+				if (targetType === "outside" && position === managedSegments.length - 1) {
+					assert.deepEqual(await readFile(join(target, "stdout.bin")), Buffer.from("outside stdout sentinel"));
+					assert.deepEqual(await readFile(join(target, "stderr.bin")), Buffer.from("outside stderr sentinel"));
+				}
+			} finally {
+				await rm(cwd, { recursive: true, force: true });
+				await rm(outside, { recursive: true, force: true });
+			}
+		}
+	}
+});
+
+test("child artifact store rejects shallow and deep regular-file managed components", async () => {
+	for (const position of [0, 3]) {
+		const cwd = await mkdtemp(join(tmpdir(), "pi-loop-child-artifacts-"));
+		const outside = await mkdtemp(join(tmpdir(), "pi-loop-child-artifacts-outside-"));
+		try {
+			await createRealAncestors(cwd, position);
+			await writeFile(managedPath(cwd, position), "not a directory");
+			const before = await snapshotTree(outside);
+
+			await assert.rejects(
+				createChildArtifactStore({ cwd, parentRunId: managedSegments[2], childRunId: managedSegments[4] }),
+			);
+			assert.equal(await readFile(managedPath(cwd, position), "utf8"), "not a directory");
+			assert.deepEqual(await snapshotTree(outside), before);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+			await rm(outside, { recursive: true, force: true });
+		}
+	}
+});
+
+test("child artifact store supports a fully pre-created real managed directory tree", async () => {
+	await withCwd(async (cwd) => {
+		const parentRunId = managedSegments[2];
+		const childRunId = managedSegments[4];
+		await mkdir(managedPath(cwd, managedSegments.length - 1), { recursive: true });
+
+		const store = await createChildArtifactStore({ cwd, parentRunId, childRunId });
+		await store.writeStdout(Buffer.from("stdout"));
+		await store.writeStderr(Buffer.from("stderr"));
+		assert.deepEqual(await store.finalize({ final: Buffer.from("final"), structured: Buffer.from("structured") }), [
+			"children/child-opaque-id/stdout.bin",
+			"children/child-opaque-id/stderr.bin",
+			"children/child-opaque-id/final.bin",
+			"children/child-opaque-id/structured.bin",
+		]);
+		assert.deepEqual(await Promise.all(["stdout.bin", "stderr.bin", "final.bin", "structured.bin"].map((filename) => readFile(artifactPath(cwd, parentRunId, childRunId, filename), "utf8"))), [
+			"stdout",
+			"stderr",
+			"final",
+			"structured",
+		]);
+	});
 });
 
 test("child artifact store appends only Buffer stream bytes in invocation order", async () => {
