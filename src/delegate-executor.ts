@@ -4,6 +4,7 @@ import { Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 import { createChildArtifactStore, type ChildArtifactStore } from "./child-artifacts.ts";
+import { createChildStructuredResultCandidate, type ChildStructuredResult } from "./child-structured-result.ts";
 import type { DelegateMetadata } from "./delegate-registry.ts";
 import { PiJsonFinalCapture } from "./pi-json-final-capture.ts";
 
@@ -18,6 +19,7 @@ export type DelegateLaunchRequest = Readonly<{
 export type DelegateLaunchHandle = Readonly<{
 	pid: number;
 	artifactRefs: Promise<readonly string[]>;
+	structuredResult: Promise<ChildStructuredResult | undefined>;
 	settled: Promise<void>;
 }>;
 
@@ -136,6 +138,7 @@ export function createPiDelegateExecutor(options: PiDelegateExecutorOptions = {}
 			};
 
 			const finalCapture = new PiJsonFinalCapture();
+			const structuredResultCandidate = createChildStructuredResultCandidate();
 			// Start all drains promptly so output-before-stdin cannot fill a pipe and deadlock.
 			const artifactRefs = Promise.all([
 				drainChildOutput(stdout, store, (artifactStore, chunk) => {
@@ -143,11 +146,17 @@ export function createPiDelegateExecutor(options: PiDelegateExecutorOptions = {}
 					return artifactStore.writeStdout(chunk);
 				}),
 				drainChildOutput(stderr, store, (artifactStore, chunk) => artifactStore.writeStderr(chunk)),
-				drainChildOutput(structured, store, (artifactStore, chunk) => artifactStore.writeStructured(chunk)),
+				drainChildOutput(structured, store, (artifactStore, chunk) => {
+					structuredResultCandidate.write(chunk);
+					return artifactStore.writeStructured(chunk);
+				}),
 			]).then(async () => {
 				const final = finalCapture.finish();
 				return (await store).finalize(final === undefined ? {} : { final });
 			});
+			const structuredResult = artifactRefs.then(() => structuredResultCandidate.finish());
+			// Observe rejection so a discarded handle cannot surface as unhandledRejection.
+			void structuredResult.catch(() => {});
 			let failLaunch: ((error: Error) => void) | undefined;
 			let firstFailure: Error | undefined;
 			// Store/drain failures must tear down sibling resources; observe so discarded handles stay quiet.
@@ -218,7 +227,7 @@ export function createPiDelegateExecutor(options: PiDelegateExecutorOptions = {}
 						stdin.end(request.task, () => {
 							if (launchDone || processDone) return;
 							launchDone = true;
-							resolve({ pid, artifactRefs, settled });
+							resolve({ pid, artifactRefs, structuredResult, settled });
 						});
 					} catch (error) {
 						fail(asError(error));

@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
 
+import { MAX_CHILD_STRUCTURED_RESULT_BYTES } from "../src/child-structured-result.ts";
 import {
 	createPiDelegateExecutor,
 	DelegateCancellationError,
@@ -467,6 +468,7 @@ fs.writeSync(3, bytes.subarray(11));`,
 			await readFile(join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "structured.bin")),
 			structured,
 		);
+		assert.deepEqual(await handle.structuredResult, { summary: "FD3_SENTINEL" });
 		await handle.settled;
 	} finally {
 		if (actual && actual.exitCode === null && actual.signalCode === null) actual.kill("SIGKILL");
@@ -525,7 +527,7 @@ test("retains fd-3 bytes through generic child failure and ignores documented-lo
 	const parentRunId = "parent-final-failure";
 	const childRunId = "child-final-failure";
 	const finalText = '{"summary":"opaque only","files":["not-authority.ts"]}';
-	const structured = Buffer.from('{"structured":"generic-failure-sentinel"}', "utf8");
+	const structured = Buffer.from('{"summary":"generic-failure-sentinel"}', "utf8");
 	const stdout = Buffer.from(`${JSON.stringify({
 		type: "message_end",
 		message: { role: "assistant", content: [{ type: "text", text: finalText }] },
@@ -554,6 +556,7 @@ test("retains fd-3 bytes through generic child failure and ignores documented-lo
 		child.emit("error", runtimeError);
 		child.emit("close", 1, null);
 		await assert.rejects(handle.settled, (error: unknown) => error === runtimeError);
+		assert.deepEqual(await handle.structuredResult, { summary: "generic-failure-sentinel" });
 		const directory = join(tempDir, ".pi", "loop", parentRunId, "children", childRunId);
 		assert.deepEqual(await readFile(join(directory, "stdout.bin")), stdout);
 		assert.deepEqual(await readFile(join(directory, "stderr.bin")), stderr);
@@ -588,6 +591,7 @@ test("stdout tool envelopes and JSON-looking final prose do not create structure
 			"children/child-no-prose-authority/final.bin",
 		]);
 		await assert.rejects(readFile(join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "structured.bin")));
+		assert.equal(await handle.structuredResult, undefined);
 		await handle.settled;
 	} finally {
 		await rm(tempDir, { recursive: true, force: true });
@@ -622,9 +626,11 @@ test("selected final artifact failures remain fail closed until actual child clo
 	})}\n`);
 
 	await withHostFailureObservation(async () => {
+		child.structured.end(Buffer.from('{"summary":"must-not-resolve"}'));
 		child.stdout.end(line);
 		child.stderr.end();
 		await assert.rejects(handle.artifactRefs, (error: unknown) => error === originError);
+		await assert.rejects(handle.structuredResult, (error: unknown) => error === originError);
 		assert.equal(finalizeCalls, 1);
 		assert.deepEqual(capturedFinal, Buffer.from("selected before failure"));
 		let settled = false;
@@ -632,6 +638,68 @@ test("selected final artifact failures remain fail closed until actual child clo
 		await oneTurn();
 		assert.equal(settled, false);
 		child.emit("close", null, "SIGTERM");
+		await assert.rejects(handle.settled, (error: unknown) => error === originError);
+	});
+});
+
+test("retains oversized fd-3 bytes without typed authority and rejects discarded structured failures quietly", async () => {
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-loop-delegate-structured-overflow-"));
+	const parentRunId = "parent-structured-overflow";
+	const childRunId = "child-structured-overflow";
+	const prefix = Buffer.from('{"summary":"a"}');
+	const structured = Buffer.concat([
+		prefix,
+		Buffer.alloc(MAX_CHILD_STRUCTURED_RESULT_BYTES - prefix.length + 1, 0x20),
+	]);
+	const child = new FakeChild();
+	const executor = createPiDelegateExecutor({ spawn: () => child as unknown as ChildProcess });
+	try {
+		const launching = executor.launch({ ...request, cwd: tempDir, parentRunId, childRunId });
+		child.emit("spawn");
+		child.deliver();
+		const handle = await launching;
+		child.structured.end(structured);
+		child.stdout.end();
+		child.stderr.end();
+		child.emit("close", 0, null);
+		assert.deepEqual(await handle.artifactRefs, [
+			"children/child-structured-overflow/stdout.bin",
+			"children/child-structured-overflow/stderr.bin",
+			"children/child-structured-overflow/structured.bin",
+		]);
+		assert.deepEqual(
+			await readFile(join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "structured.bin")),
+			structured,
+		);
+		assert.equal(await handle.structuredResult, undefined);
+		await handle.settled;
+	} finally {
+		await rm(tempDir, { recursive: true, force: true });
+	}
+
+	const failingChild = new FakeChild();
+	const originError = new Error("structured artifact finalize failed");
+	const failingExecutor = createPiDelegateExecutor({
+		spawn: () => failingChild as unknown as ChildProcess,
+		createArtifactStore: async () => ({
+			writeStdout: async () => {},
+			writeStderr: async () => {},
+			writeStructured: async () => {},
+			finalize: async () => {
+				throw originError;
+			},
+		}),
+	});
+	await withHostFailureObservation(async () => {
+		const launching = failingExecutor.launch(request);
+		failingChild.emit("spawn");
+		failingChild.deliver();
+		const handle = await launching;
+		// Discard structuredResult deliberately; internal observation must keep the host quiet.
+		failingChild.stdout.end();
+		failingChild.stderr.end();
+		failingChild.emit("close", 0, null);
+		await assert.rejects(handle.artifactRefs, (error: unknown) => error === originError);
 		await assert.rejects(handle.settled, (error: unknown) => error === originError);
 	});
 });
@@ -784,24 +852,32 @@ test("waits for delayed stream writes and one gated finalize before exposing ref
 	child.deliver();
 	const handle = await launching;
 	let refsOutcome: "resolved" | "rejected" | undefined;
+	let structuredOutcome: "resolved" | "rejected" | undefined;
 	let settledOutcome: "resolved" | "rejected" | undefined;
 	let refsCallbacks = 0;
+	let structuredCallbacks = 0;
 	let settledCallbacks = 0;
 	void handle.artifactRefs.then(
 		() => { refsCallbacks += 1; refsOutcome = "resolved"; },
 		() => { refsCallbacks += 1; refsOutcome = "rejected"; },
+	);
+	void handle.structuredResult.then(
+		() => { structuredCallbacks += 1; structuredOutcome = "resolved"; },
+		() => { structuredCallbacks += 1; structuredOutcome = "rejected"; },
 	);
 	void handle.settled.then(
 		() => { settledCallbacks += 1; settledOutcome = "resolved"; },
 		() => { settledCallbacks += 1; settledOutcome = "rejected"; },
 	);
 
+	child.structured.write(Buffer.from('{"summary":"gated"}'));
 	child.stdout.end(Buffer.from("stdout"));
 	child.stderr.end(Buffer.from("stderr"));
 	await writeEntered.promise;
 	child.emit("close", 0, null);
 	await oneTurn();
 	assert.equal(refsOutcome, undefined);
+	assert.equal(structuredOutcome, undefined);
 	assert.equal(settledOutcome, undefined);
 	assert.equal(finalizeCalls, 0);
 
@@ -811,13 +887,16 @@ test("waits for delayed stream writes and one gated finalize before exposing ref
 	assert.ok(order.indexOf("finalize start") > order.indexOf("stdout write end"));
 	assert.ok(order.indexOf("finalize start") > order.indexOf("stderr write end"));
 	assert.equal(refsOutcome, undefined);
+	assert.equal(structuredOutcome, undefined);
 	assert.equal(settledOutcome, undefined);
 
 	releaseFinalize.resolve();
 	assert.deepEqual(await handle.artifactRefs, refs);
+	assert.deepEqual(await handle.structuredResult, { summary: "gated" });
 	await handle.settled;
 	assert.deepEqual(order.at(-1), "finalize end");
 	assert.equal(refsCallbacks, 1);
+	assert.equal(structuredCallbacks, 1);
 	assert.equal(settledCallbacks, 1);
 
 	child.emit("spawn");
@@ -828,6 +907,7 @@ test("waits for delayed stream writes and one gated finalize before exposing ref
 	await oneTurn();
 	assert.equal(finalizeCalls, 1);
 	assert.equal(refsCallbacks, 1);
+	assert.equal(structuredCallbacks, 1);
 	assert.equal(settledCallbacks, 1);
 });
 
@@ -841,7 +921,7 @@ test("retains exact stream artifacts for a real signal-cancelled child", async (
 		message: { role: "assistant", content: [{ type: "text", text: finalText }] },
 	})}\n`, "utf8");
 	const stderr = Buffer.from([0xfe, 0x00, 0x42]);
-	const structured = Buffer.from('{"structured":"cancel-sentinel"}', "utf8");
+	const structured = Buffer.from('{"summary":"cancel-sentinel"}', "utf8");
 	const stdoutPath = join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "stdout.bin");
 	const stderrPath = join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "stderr.bin");
 	const finalPath = join(tempDir, ".pi", "loop", parentRunId, "children", childRunId, "final.bin");
@@ -883,6 +963,7 @@ async function writeAll(stream, bytes) { if (!stream.write(Buffer.from(bytes, 'b
 			assert.equal(error.signal, "SIGTERM");
 			return true;
 		});
+		assert.deepEqual(await handle.structuredResult, { summary: "cancel-sentinel" });
 		assert.deepEqual(await readFile(stdoutPath), stdout);
 		assert.deepEqual(await readFile(stderrPath), stderr);
 		assert.deepEqual(await readFile(finalPath), Buffer.from(finalText));

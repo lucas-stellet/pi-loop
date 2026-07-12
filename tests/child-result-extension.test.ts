@@ -2,9 +2,22 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 
+type Schema = {
+	type?: string;
+	additionalProperties?: boolean;
+	properties?: Record<string, Schema>;
+	required?: readonly string[];
+	items?: Schema;
+	maxItems?: number;
+	maxLength?: number;
+	pattern?: string;
+	minimum?: number;
+	maximum?: number;
+};
+
 type RegisteredTool = {
 	name: string;
-	parameters: { required?: readonly string[]; properties?: Record<string, { type?: string }> };
+	parameters: { required?: readonly string[]; properties?: Record<string, Schema> };
 	execute: (toolCallId: string, params: unknown) => Promise<unknown>;
 };
 
@@ -20,16 +33,49 @@ async function registeredTool(): Promise<RegisteredTool> {
 	return tools[0]!;
 }
 
-test("package-owned extension registers only loop_result with one required opaque result record", async () => {
+test("package-owned extension registers only loop_result with one required strict result record", async () => {
 	const tool = await registeredTool();
+	const result = tool.parameters.properties?.result!;
 	assert.equal(tool.name, "loop_result");
 	assert.deepEqual(tool.parameters.required, ["result"]);
 	assert.deepEqual(Object.keys(tool.parameters.properties ?? {}), ["result"]);
-	assert.equal(tool.parameters.properties?.result?.type, "object");
+	assert.equal(result.type, "object");
+	assert.equal(result.additionalProperties, false);
+	assert.deepEqual(Object.keys(result.properties ?? {}).sort(), [
+		"artifactRefs", "blockers", "classification", "confidence", "filesChanged", "nits", "review", "summary", "validations",
+	]);
+	assert.equal(result.required, undefined);
+	for (const key of ["artifactRefs", "filesChanged", "validations", "nits", "blockers"]) {
+		assert.equal(result?.properties?.[key]?.maxItems, 100, key);
+	}
+	assert.equal(result?.properties?.review?.properties?.findings?.maxItems, 100);
+	for (const [location, schema] of [
+		["summary", result?.properties?.summary],
+		["artifactRefs item", result?.properties?.artifactRefs?.items],
+		["filesChanged item", result?.properties?.filesChanged?.items],
+		["validation command", result?.properties?.validations?.items?.properties?.command],
+		["validation outcome", result?.properties?.validations?.items?.properties?.outcome],
+		["review verdict", result?.properties?.review?.properties?.verdict],
+		["review finding", result?.properties?.review?.properties?.findings?.items],
+		["nit", result?.properties?.nits?.items],
+		["blocker", result?.properties?.blockers?.items],
+		["classification", result?.properties?.classification],
+	] as const) {
+		assert.equal(schema?.maxLength, 4096, location);
+		assert.equal(schema?.pattern, ".*\\S.*", location);
+	}
+	assert.equal(result?.properties?.confidence?.minimum, 0);
+	assert.equal(result?.properties?.confidence?.maximum, 1);
+	assert.equal(result?.properties?.validations?.items?.additionalProperties, false);
+	assert.deepEqual(result?.properties?.validations?.items?.required, ["command", "outcome"]);
+	assert.deepEqual(Object.keys(result?.properties?.validations?.items?.properties ?? {}).sort(), ["command", "outcome"]);
+	assert.equal(result?.properties?.review?.additionalProperties, false);
+	assert.deepEqual(result?.properties?.review?.required, ["verdict", "findings"]);
+	assert.deepEqual(Object.keys(result?.properties?.review?.properties ?? {}).sort(), ["findings", "verdict"]);
 });
 
 test("loop_result writes exact unicode JSON to fd 3, terminates without payload leakage, and claims failed attempts", () => {
-	const result = { sentinel: "FD3_ONLY_SENTINEL", nested: { unicode: "雪😀" } };
+	const result = { summary: "FD3_ONLY_SENTINEL 雪😀", review: { verdict: "APPROVE", findings: [] } };
 	const script = `
 		import factory from ${JSON.stringify(extensionUrl)};
 		const tools = [];
@@ -43,7 +89,7 @@ test("loop_result writes exact unicode JSON to fd 3, terminates without payload 
 	assert.deepEqual(child.output[3], Buffer.from(JSON.stringify(result), "utf8"));
 	const acknowledgementText = child.stdout.toString("utf8");
 	assert.equal(JSON.parse(acknowledgementText).terminate, true);
-	assert.equal(acknowledgementText.includes(result.sentinel), false);
+	assert.equal(acknowledgementText.includes(result.summary), false);
 });
 
 test("loop_result rejects missing and unserializable results, and an unavailable fd claims the attempt before retry", async () => {
@@ -54,8 +100,8 @@ test("loop_result rejects missing and unserializable results, and an unavailable
 		await assert.rejects(tool.execute("invalid", params));
 	}
 	const unavailable = await registeredTool();
-	await assert.rejects(unavailable.execute("unavailable-fd", { result: { sentinel: "MUST_NOT_APPEND" } }));
-	await assert.rejects(unavailable.execute("retry", { result: { second: true } }));
+	await assert.rejects(unavailable.execute("unavailable-fd", { result: { summary: "MUST_NOT_APPEND" } }));
+	await assert.rejects(unavailable.execute("retry", { result: { summary: "second" } }));
 });
 
 test("loop_result rejects top-level stringify-to-undefined after claiming its only attempt", () => {

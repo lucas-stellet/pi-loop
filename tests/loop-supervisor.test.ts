@@ -163,7 +163,7 @@ function createHarness(options: {
 function fixtureDelegateExecutor(): DelegateExecutor {
 	return {
 		async launch() {
-			return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: new Promise<void>(() => {}) };
+			return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), structuredResult: Promise.resolve(undefined), settled: new Promise<void>(() => {}) };
 		},
 	};
 }
@@ -1346,7 +1346,7 @@ test("loop_delegate rejects an unknown named agent before it journals or publish
 	const delegateExecutor: DelegateExecutor = {
 		async launch() {
 			launches += 1;
-			return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: Promise.resolve() };
+			return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), structuredResult: Promise.resolve(undefined), settled: Promise.resolve() };
 		},
 	};
 	installLoop(harness, { delegateExecutor });
@@ -1380,7 +1380,7 @@ test("loop_delegate validates the active loop before resolving a definition", as
 		delegateExecutor: {
 			async launch() {
 				launches += 1;
-				return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: Promise.resolve() };
+				return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), structuredResult: Promise.resolve(undefined), settled: Promise.resolve() };
 			},
 		},
 	});
@@ -1398,7 +1398,7 @@ test("loop_delegate rejects a missing controlled definition without publication 
 	const delegateExecutor: DelegateExecutor = {
 		async launch() {
 			launches += 1;
-			return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: Promise.resolve() };
+			return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), structuredResult: Promise.resolve(undefined), settled: Promise.resolve() };
 		},
 	};
 	installLoop(harness, { delegateExecutor, delegateResolver: async () => undefined });
@@ -1435,7 +1435,7 @@ test("loop_delegate resolves a controlled on-disk definition for its one started
 			delegateExecutor: {
 				async launch(request) {
 					launches.push(request);
-					return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: Promise.resolve() };
+					return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), structuredResult: Promise.resolve(undefined), settled: Promise.resolve() };
 				},
 			},
 		});
@@ -1500,7 +1500,7 @@ test("loop_delegate publishes one canonical started association before launching
 		installLoop(harness, { delegateExecutor: { async launch(request) {
 			launchChildId = request.childRunId;
 			order.push("launch");
-			return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: new Promise<void>(() => {}) };
+			return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), structuredResult: Promise.resolve(undefined), settled: new Promise<void>(() => {}) };
 		} } });
 		await executeTool(harness, "loop_start", { objective: "Publish before launching" });
 		parentRunId = lastLoopState(harness).runId as string;
@@ -1555,7 +1555,7 @@ test("loop_delegate suppresses launch and later publications when its started di
 			const harness = createHarness({ cwd });
 			installLoop(harness, { delegateExecutor: { async launch(request) {
 				launches.push(request);
-				return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: Promise.resolve() };
+				return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), structuredResult: Promise.resolve(undefined), settled: Promise.resolve() };
 			} } });
 			await executeTool(harness, "loop_start", { objective: "Fail closed before delegation launch" });
 			const parentRunId = lastLoopState(harness).runId as string;
@@ -1586,7 +1586,7 @@ test("loop_delegate suppresses launch and later publications when its started mi
 		} });
 		installLoop(harness, { delegateExecutor: { async launch(request) {
 			launches.push(request);
-			return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: Promise.resolve() };
+			return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), structuredResult: Promise.resolve(undefined), settled: Promise.resolve() };
 		} } });
 		await executeTool(harness, "loop_start", { objective: "Fail closed after canonical delegation append" });
 		const parentRunId = lastLoopState(harness).runId as string;
@@ -1921,7 +1921,7 @@ test("loop_delegate publishes the successful child lifecycle without waiting for
 						`children/${request.childRunId}/stdout.bin`,
 						`children/${request.childRunId}/stderr.bin`,
 					];
-					return { pid: process.pid + 1, artifactRefs: Promise.resolve(artifactRefs), settled: childSettled };
+					return { pid: process.pid + 1, artifactRefs: Promise.resolve(artifactRefs), structuredResult: Promise.resolve(undefined), settled: childSettled };
 				},
 			},
 		});
@@ -2038,7 +2038,7 @@ test("loop_status and prompt expose a retained structured ref but never its payl
 					const store = await createChildArtifactStore({ cwd: request.cwd, parentRunId: request.parentRunId, childRunId: request.childRunId });
 					await store.writeStructured(Buffer.from(sentinel, "utf8"));
 					const artifactRefs = await store.finalize();
-					return { pid: process.pid + 1, artifactRefs: Promise.resolve(artifactRefs), settled: Promise.resolve() };
+					return { pid: process.pid + 1, artifactRefs: Promise.resolve(artifactRefs), structuredResult: Promise.resolve(undefined), settled: Promise.resolve() };
 				},
 			},
 		});
@@ -2082,7 +2082,7 @@ test("loop_delegate accepts every fixed artifact shape only after refs settle an
 			installLoop(harness, {
 				delegateExecutor: {
 					async launch() {
-						return { pid: process.pid + 1, artifactRefs: refsCompletion.promise, settled: settlement.promise };
+						return { pid: process.pid + 1, artifactRefs: refsCompletion.promise, structuredResult: Promise.resolve(undefined), settled: settlement.promise };
 					},
 				},
 			});
@@ -2158,7 +2158,7 @@ test("loop_delegate waits for valid refs on completed failed and cancelled settl
 				delegateExecutor: {
 					async launch(request) {
 						childRunId = request.childRunId;
-						return { pid: process.pid + 1, artifactRefs: refsCompletion.promise, settled: settlement.promise };
+						return { pid: process.pid + 1, artifactRefs: refsCompletion.promise, structuredResult: Promise.resolve(undefined), settled: settlement.promise };
 					},
 				},
 			});
@@ -2221,7 +2221,7 @@ test("loop_delegate fails closed for unsafe or rejected artifact refs without le
 					async launch(request) {
 						childRunId = request.childRunId;
 						unsafeValue = row.value(childRunId);
-						return { pid: process.pid + 1, artifactRefs: Promise.resolve(unsafeValue as never), settled: settlement.promise };
+						return { pid: process.pid + 1, artifactRefs: Promise.resolve(unsafeValue as never), structuredResult: Promise.resolve(undefined), settled: settlement.promise };
 					},
 				},
 			});
@@ -2259,7 +2259,7 @@ test("loop_delegate fails closed for unsafe or rejected artifact refs without le
 			const harness = createHarness({ cwd });
 			installLoop(harness, { delegateExecutor: { async launch(request) {
 				childRunId = request.childRunId;
-				return { pid: process.pid + 1, artifactRefs: refsCompletion.promise, settled: settlement.promise };
+				return { pid: process.pid + 1, artifactRefs: refsCompletion.promise, structuredResult: Promise.resolve(undefined), settled: settlement.promise };
 			} } });
 			await executeTool(harness, "loop_start", { objective: `Reject unavailable refs ${index}` });
 			await executeTool(harness, "loop_delegate", { name: "delegate", task: "Await rejected refs" });
@@ -2311,7 +2311,7 @@ test("loop_delegate detached completed publication fails closed at each journal 
 			installLoop(harness, {
 				delegateExecutor: {
 					async launch() {
-						return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled };
+						return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), structuredResult: Promise.resolve(undefined), settled };
 					},
 				},
 			});
@@ -2431,7 +2431,7 @@ test("terminal artifact refs fail closed at every journal stage for completed fa
 						`children/${request.childRunId}/stdout.bin`,
 						`children/${request.childRunId}/stderr.bin`,
 					];
-					return { pid: process.pid + 1, artifactRefs: Promise.resolve(artifactRefs), settled: settlement.promise };
+					return { pid: process.pid + 1, artifactRefs: Promise.resolve(artifactRefs), structuredResult: Promise.resolve(undefined), settled: settlement.promise };
 				} } });
 				const count = (type: string) => harness.appendEntries.filter((entry) => entry.customType === type).length;
 
@@ -2530,7 +2530,7 @@ test("loop_delegate publishes exactly one first terminal outcome after duplicate
 							`children/${request.childRunId}/stderr.bin`,
 						];
 						launches.push({ childRunId: request.childRunId, artifactRefs });
-						return { pid: process.pid + 1, artifactRefs: Promise.resolve(artifactRefs), settled };
+						return { pid: process.pid + 1, artifactRefs: Promise.resolve(artifactRefs), structuredResult: Promise.resolve(undefined), settled };
 					},
 				},
 			});
@@ -2642,7 +2642,7 @@ test("clear/restart callback isolation retains late delegated terminals with the
 							`children/${request.childRunId}/stdout.bin`,
 							`children/${request.childRunId}/stderr.bin`,
 						];
-						return { pid: process.pid + 1, artifactRefs: Promise.resolve(artifactRefs), settled };
+						return { pid: process.pid + 1, artifactRefs: Promise.resolve(artifactRefs), structuredResult: Promise.resolve(undefined), settled };
 					},
 				},
 			});
@@ -2751,7 +2751,7 @@ test("loop_delegate publishes one durable runtime failed association after settl
 			delegateExecutor: {
 				async launch(request) {
 					launches.push(request);
-					return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: childSettled };
+					return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), structuredResult: Promise.resolve(undefined), settled: childSettled };
 				},
 			},
 		});
@@ -2856,7 +2856,7 @@ test("loop_delegate publishes one durable cancelled association after typed canc
 				if (customType === "loop-delegation") legacyDelegations.push(data as { runId?: unknown; childRunId?: unknown });
 			},
 		});
-		installLoop(harness, { delegateExecutor: { async launch() { return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled }; } } });
+		installLoop(harness, { delegateExecutor: { async launch() { return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), structuredResult: Promise.resolve(undefined), settled }; } } });
 		process.on("unhandledRejection", onUnhandled);
 		try {
 			await withFileHandleMethod("sync", (original) => async function sync(this: FileHandle) {

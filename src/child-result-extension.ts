@@ -3,6 +3,8 @@ import { writeSync } from "node:fs";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
+import { CHILD_STRUCTURED_RESULT_SCHEMA } from "./child-structured-result.ts";
+
 type FullWriter = (fd: number, bytes: Buffer, offset: number, length: number) => number;
 
 const nodeWrite: FullWriter = (fd, bytes, offset, length) => writeSync(fd, bytes, offset, length);
@@ -26,9 +28,9 @@ export default function (pi: ExtensionAPI): void {
 		defineTool({
 			name: "loop_result",
 			label: "Loop result",
-			description: "Return the final opaque result to the loop runtime.",
+			description: "Return the final structured result to the loop runtime.",
 			parameters: Type.Object({
-				result: Type.Object({}, { additionalProperties: true }),
+				result: CHILD_STRUCTURED_RESULT_SCHEMA,
 			}),
 			async execute(_toolCallId, params) {
 				if (claimed) throw new Error("loop_result was already called.");
