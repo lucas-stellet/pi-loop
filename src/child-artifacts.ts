@@ -92,10 +92,11 @@ function assertSafeFile(stat: { isFile(): boolean; nlink: number }): void {
 	}
 }
 
-async function writeArtifact(path: string, content: Buffer, flags: number): Promise<void> {
-	const handle = await open(path, flags | fsConstants.O_NOFOLLOW, 0o600);
+async function writeArtifact(path: string, content: Buffer, flags: number, truncate = false): Promise<void> {
+	const handle = await open(path, flags | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK, 0o600);
 	try {
 		assertSafeFile(await handle.stat());
+		if (truncate) await handle.truncate(0);
 		await handle.writeFile(content);
 	} finally {
 		await handle.close();
@@ -107,7 +108,7 @@ async function appendArtifact(path: string, content: Buffer): Promise<void> {
 }
 
 async function replaceArtifact(path: string, content: Buffer): Promise<void> {
-	await writeArtifact(path, content, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC);
+	await writeArtifact(path, content, fsConstants.O_WRONLY | fsConstants.O_CREAT, true);
 }
 
 /** Accept only omitted input or a plain object; require every present final/structured value to be a Buffer. */
@@ -138,9 +139,9 @@ function readFinalizeBuffers(output: unknown): { final?: Buffer; structured?: Bu
 	return result;
 }
 
-/** Re-open with O_NOFOLLOW so exposed refs always resolve to a regular single-link file. */
+/** Re-open with O_NOFOLLOW | O_NONBLOCK so exposed refs always resolve to a regular single-link file without blocking. */
 async function assertSafeArtifact(path: string): Promise<void> {
-	const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+	const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
 	try {
 		assertSafeFile(await handle.stat());
 	} finally {

@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { link, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { createChildArtifactStore } from "../src/child-artifacts.ts";
 
@@ -27,6 +29,37 @@ function managedPath(cwd: string, position: number): string {
 
 async function createRealAncestors(cwd: string, position: number): Promise<void> {
 	if (position > 0) await mkdir(managedPath(cwd, position - 1), { recursive: true });
+}
+
+const fifoProbe = fileURLToPath(new URL("./fixtures/child-artifact-fifo-probe.ts", import.meta.url));
+
+async function runFifoProbe(cwd: string, kind: string, operation: "write" | "finalize" | "ref"): Promise<string> {
+	const child = spawn(process.execPath, [fifoProbe, cwd, kind, operation], { stdio: ["ignore", "pipe", "pipe"] });
+	let stdout = "";
+	child.stdout.setEncoding("utf8");
+	child.stdout.on("data", (chunk) => {
+		stdout += chunk;
+	});
+
+	return new Promise((resolve, reject) => {
+		const timeout = setTimeout(() => child.kill("SIGKILL"), 1_000);
+		child.once("error", (error) => {
+			clearTimeout(timeout);
+			reject(error);
+		});
+		child.once("close", (code, signal) => {
+			clearTimeout(timeout);
+			if (signal === "SIGKILL") {
+				reject(new Error(`FIFO probe timed out for ${kind} ${operation}.`));
+				return;
+			}
+			if (code !== 0) {
+				reject(new Error(`FIFO probe exited ${code} for ${kind} ${operation}.`));
+				return;
+			}
+			resolve(stdout.trim());
+		});
+	});
 }
 
 type TreeEntry = { type: "directory" } | { type: "file"; bytes: Buffer } | { type: "symlink" } | { type: "other" };
@@ -247,6 +280,80 @@ test("child artifact store validates finalize inputs atomically and returns dete
 		const atomic = await createChildArtifactStore({ cwd, parentRunId, childRunId: "atomic" });
 		await assert.rejects(atomic.finalize({ final: Buffer.from("must-not-write"), structured: "coerced" as unknown as Buffer }));
 		await assert.rejects(readFile(artifactPath(cwd, parentRunId, "atomic", "final.bin")));
+	});
+});
+
+test("child artifact store rejects unsafe writable destinations without changing outside targets", async () => {
+	const artifacts = [
+		{ kind: "stdout", operation: (store: Awaited<ReturnType<typeof createChildArtifactStore>>) => store.writeStdout(Buffer.from("stdout")) },
+		{ kind: "stderr", operation: (store: Awaited<ReturnType<typeof createChildArtifactStore>>) => store.writeStderr(Buffer.from("stderr")) },
+		{ kind: "final", operation: (store: Awaited<ReturnType<typeof createChildArtifactStore>>) => store.finalize({ final: Buffer.from("final") }) },
+		{ kind: "structured", operation: (store: Awaited<ReturnType<typeof createChildArtifactStore>>) => store.finalize({ structured: Buffer.from("structured") }) },
+	] as const;
+
+	for (const artifact of artifacts) {
+		for (const unsafe of ["symlink", "hardlink", "directory"] as const) {
+			await withCwd(async (cwd) => {
+				const parentRunId = "parent-opaque-id";
+				const childRunId = `${artifact.kind}-${unsafe}`;
+				const store = await createChildArtifactStore({ cwd, parentRunId, childRunId });
+				const path = artifactPath(cwd, parentRunId, childRunId, `${artifact.kind}.bin`);
+				const sentinel = join(cwd, `${artifact.kind}-${unsafe}-sentinel`);
+				await rm(path, { recursive: true, force: true });
+				if (unsafe === "directory") await mkdir(path);
+				else {
+					const bytes = Buffer.from(`${artifact.kind}-${unsafe}-sentinel`);
+					await writeFile(sentinel, bytes);
+					if (unsafe === "symlink") await symlink(sentinel, path);
+					else await link(sentinel, path);
+					await assert.rejects(artifact.operation(store));
+					assert.deepEqual(await readFile(sentinel), bytes);
+					return;
+				}
+				await assert.rejects(artifact.operation(store));
+				assert.equal((await lstat(path)).isDirectory(), true);
+			});
+		}
+	}
+});
+
+test("child artifact store rejects unsafe stream paths before exposing final refs", async () => {
+	for (const unsafe of ["symlink", "hardlink", "directory"] as const) {
+		await withCwd(async (cwd) => {
+			const parentRunId = "parent-opaque-id";
+			const childRunId = `ref-${unsafe}`;
+			const store = await createChildArtifactStore({ cwd, parentRunId, childRunId });
+			const path = artifactPath(cwd, parentRunId, childRunId, "stdout.bin");
+			const sentinel = join(cwd, `ref-${unsafe}-sentinel`);
+			await rm(path, { recursive: true, force: true });
+			if (unsafe === "directory") {
+				await mkdir(path);
+			} else {
+				const bytes = Buffer.from(`ref-${unsafe}-sentinel`);
+				await writeFile(sentinel, bytes);
+				if (unsafe === "symlink") await symlink(sentinel, path);
+				else await link(sentinel, path);
+				await assert.rejects(store.finalize());
+				assert.deepEqual(await readFile(sentinel), bytes);
+				return;
+			}
+			await assert.rejects(store.finalize());
+			assert.equal((await lstat(path)).isDirectory(), true);
+		});
+	}
+});
+
+test("child artifact store FIFO operations reject in bounded subprocesses", async () => {
+	await withCwd(async (cwd) => {
+		for (const [kind, operation] of [
+			["stdout", "write"],
+			["stderr", "write"],
+			["final", "finalize"],
+			["structured", "finalize"],
+			["stdout", "ref"],
+		] as const) {
+			assert.equal(await runFifoProbe(cwd, kind, operation), "REJECTED");
+		}
 	});
 });
 
