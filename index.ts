@@ -71,6 +71,28 @@ function toProjectableEvents(events: readonly JournalEvent[]): ProjectableEvent[
 	return projectable;
 }
 
+function validatedArtifactRefs(value: unknown, childRunId: string): string[] | undefined {
+	if (!Array.isArray(value) || !value.every((ref): ref is string => typeof ref === "string")) {
+		return undefined;
+	}
+	const prefix = `children/${childRunId}/`;
+	const stdout = `${prefix}stdout.bin`;
+	const stderr = `${prefix}stderr.bin`;
+	const final = `${prefix}final.bin`;
+	const structured = `${prefix}structured.bin`;
+	const allowed: readonly (readonly string[])[] = [
+		[],
+		[stdout, stderr],
+		[stdout, stderr, final],
+		[stdout, stderr, structured],
+		[stdout, stderr, final, structured],
+	];
+	const matches = allowed.some(
+		(shape) => shape.length === value.length && shape.every((ref, index) => ref === value[index]),
+	);
+	return matches ? [...value] : undefined;
+}
+
 function formatLoopStatus(state: LoopState, projectedContext?: string): string {
 	if (state.state === "idle") {
 		return `Loop state: ${state.state}`;
@@ -496,11 +518,14 @@ export default function piLoop(
 					persist();
 				}
 			};
-			const publishLifecycle = async (status: "running" | "completed" | "failed" | "cancelled") => {
+			const publishLifecycle = async (
+				status: "running" | "completed" | "failed" | "cancelled",
+				artifactRefs: readonly string[] = [],
+			) => {
 				await appendLoopEvent("delegation.updated", {
 					childId: origin.childRunId,
 					status,
-					artifactRefs: [],
+					artifactRefs: [...artifactRefs],
 				}, loopState, originChannel);
 				persistIfCurrent();
 			};
@@ -514,10 +539,20 @@ export default function piLoop(
 			try {
 				const handle = await delegateExecutor.launch({ parentRunId: origin.parentRunId, childRunId: origin.childRunId, cwd: ctx.cwd, task: params.task, metadata });
 				await publishLifecycle("running");
-				void handle.settled.then(
-					() => publishLifecycle("completed"),
-					(error) => publishLifecycle(error instanceof DelegateCancellationError ? "cancelled" : "failed"),
-				).catch(() => undefined);
+				void Promise.allSettled([handle.settled, handle.artifactRefs]).then(([settled, refs]) => {
+					const artifactRefs = refs.status === "fulfilled"
+						? validatedArtifactRefs(refs.value, origin.childRunId)
+						: undefined;
+					if (!artifactRefs) {
+						return publishLifecycle("failed");
+					}
+					const status = settled.status === "fulfilled"
+						? "completed"
+						: settled.reason instanceof DelegateCancellationError
+							? "cancelled"
+							: "failed";
+					return publishLifecycle(status, artifactRefs);
+				}).catch(() => undefined);
 			} catch (error) {
 				await publishLifecycle("failed");
 				throw error;
