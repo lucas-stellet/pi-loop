@@ -512,7 +512,7 @@ export default function piLoop(
 			pi.appendEntry("loop-delegation", { ...params, runId: origin.parentRunId, childRunId: origin.childRunId });
 			persistIfCurrent();
 			try {
-				const handle = await delegateExecutor.launch({ childRunId: origin.childRunId, cwd: ctx.cwd, task: params.task, metadata });
+				const handle = await delegateExecutor.launch({ parentRunId: origin.parentRunId, childRunId: origin.childRunId, cwd: ctx.cwd, task: params.task, metadata });
 				await publishLifecycle("running");
 				void handle.settled.then(
 					() => publishLifecycle("completed"),

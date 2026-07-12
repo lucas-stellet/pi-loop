@@ -162,7 +162,7 @@ function createHarness(options: {
 function fixtureDelegateExecutor(): DelegateExecutor {
 	return {
 		async launch() {
-			return { pid: process.pid + 1, settled: new Promise<void>(() => {}) };
+			return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: new Promise<void>(() => {}) };
 		},
 	};
 }
@@ -1321,7 +1321,7 @@ test("loop_delegate rejects an unknown named agent before it journals or publish
 	const delegateExecutor: DelegateExecutor = {
 		async launch() {
 			launches += 1;
-			return { pid: process.pid + 1, settled: Promise.resolve() };
+			return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: Promise.resolve() };
 		},
 	};
 	installLoop(harness, { delegateExecutor });
@@ -1355,7 +1355,7 @@ test("loop_delegate validates the active loop before resolving a definition", as
 		delegateExecutor: {
 			async launch() {
 				launches += 1;
-				return { pid: process.pid + 1, settled: Promise.resolve() };
+				return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: Promise.resolve() };
 			},
 		},
 	});
@@ -1373,7 +1373,7 @@ test("loop_delegate rejects a missing controlled definition without publication 
 	const delegateExecutor: DelegateExecutor = {
 		async launch() {
 			launches += 1;
-			return { pid: process.pid + 1, settled: Promise.resolve() };
+			return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: Promise.resolve() };
 		},
 	};
 	installLoop(harness, { delegateExecutor, delegateResolver: async () => undefined });
@@ -1410,7 +1410,7 @@ test("loop_delegate resolves a controlled on-disk definition for its one started
 			delegateExecutor: {
 				async launch(request) {
 					launches.push(request);
-					return { pid: process.pid + 1, settled: Promise.resolve() };
+					return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: Promise.resolve() };
 				},
 			},
 		});
@@ -1475,7 +1475,7 @@ test("loop_delegate publishes one canonical started association before launching
 		installLoop(harness, { delegateExecutor: { async launch(request) {
 			launchChildId = request.childRunId;
 			order.push("launch");
-			return { pid: process.pid + 1, settled: new Promise<void>(() => {}) };
+			return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: new Promise<void>(() => {}) };
 		} } });
 		await executeTool(harness, "loop_start", { objective: "Publish before launching" });
 		parentRunId = lastLoopState(harness).runId as string;
@@ -1530,7 +1530,7 @@ test("loop_delegate suppresses launch and later publications when its started di
 			const harness = createHarness({ cwd });
 			installLoop(harness, { delegateExecutor: { async launch(request) {
 				launches.push(request);
-				return { pid: process.pid + 1, settled: Promise.resolve() };
+				return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: Promise.resolve() };
 			} } });
 			await executeTool(harness, "loop_start", { objective: "Fail closed before delegation launch" });
 			const parentRunId = lastLoopState(harness).runId as string;
@@ -1561,7 +1561,7 @@ test("loop_delegate suppresses launch and later publications when its started mi
 		} });
 		installLoop(harness, { delegateExecutor: { async launch(request) {
 			launches.push(request);
-			return { pid: process.pid + 1, settled: Promise.resolve() };
+			return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: Promise.resolve() };
 		} } });
 		await executeTool(harness, "loop_start", { objective: "Fail closed after canonical delegation append" });
 		const parentRunId = lastLoopState(harness).runId as string;
@@ -1890,7 +1890,7 @@ test("loop_delegate publishes the successful child lifecycle without waiting for
 					launches.push(request);
 					signalLaunch();
 					await launchReleased;
-					return { pid: process.pid + 1, settled: childSettled };
+					return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: childSettled };
 				},
 			},
 		});
@@ -2033,7 +2033,7 @@ test("loop_delegate detached completed publication fails closed at each journal 
 			installLoop(harness, {
 				delegateExecutor: {
 					async launch() {
-						return { pid: process.pid + 1, settled };
+						return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled };
 					},
 				},
 			});
@@ -2136,7 +2136,7 @@ test("loop_delegate publishes exactly one first terminal outcome after duplicate
 				delegateExecutor: {
 					async launch(request) {
 						launches.push(request);
-						return { pid: process.pid + 1, settled };
+						return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled };
 					},
 				},
 			});
@@ -2237,7 +2237,7 @@ test("clear/restart callback isolation retains late delegated terminals with the
 			installLoop(harness, {
 				delegateExecutor: {
 					async launch() {
-						return { pid: process.pid + 1, settled };
+						return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled };
 					},
 				},
 			});
@@ -2335,7 +2335,7 @@ test("loop_delegate publishes one durable runtime failed association after settl
 			delegateExecutor: {
 				async launch(request) {
 					launches.push(request);
-					return { pid: process.pid + 1, settled: childSettled };
+					return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled: childSettled };
 				},
 			},
 		});
@@ -2440,7 +2440,7 @@ test("loop_delegate publishes one durable cancelled association after typed canc
 				if (customType === "loop-delegation") legacyDelegations.push(data as { runId?: unknown; childRunId?: unknown });
 			},
 		});
-		installLoop(harness, { delegateExecutor: { async launch() { return { pid: process.pid + 1, settled }; } } });
+		installLoop(harness, { delegateExecutor: { async launch() { return { pid: process.pid + 1, artifactRefs: Promise.resolve([]), settled }; } } });
 		process.on("unhandledRejection", onUnhandled);
 		try {
 			await withFileHandleMethod("sync", (original) => async function sync(this: FileHandle) {
