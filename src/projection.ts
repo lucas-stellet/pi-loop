@@ -42,7 +42,15 @@ export type EventProjection = {
 	lifecycle: { state: string; settlement: string | undefined; highWater: number };
 	iteration: { used: number; max: number | undefined };
 	budget: { tokensUsed: number; tokensMax: number | undefined };
-	delegations: { sequence: number; childId: string; status: string; artifactRefs: string[] }[];
+	delegations: {
+		sequence: number;
+		childId: string;
+		status: string;
+		artifactRefs: string[];
+		summary?: string;
+		confidence?: number;
+		classification?: string;
+	}[];
 	validations: { sequence: number; command: string; outcome: string }[];
 	reviews: { sequence: number; verdict: string; findings: string[] }[];
 	workspaceChanges: { sequence: number; files: string[] }[];
@@ -282,7 +290,20 @@ function applyFact(projection: EventProjection, event: ProjectableEvent, referen
 				pushDiagnostic(projection, "malformed-payload", sequence);
 				return;
 			}
-			projection.delegations.push({ sequence, childId, status, artifactRefs });
+			const delegation: EventProjection["delegations"][number] = { sequence, childId, status, artifactRefs };
+			const summary = asString(payload.summary);
+			const confidence = asNumber(payload.confidence);
+			const classification = asString(payload.classification);
+			if (summary !== undefined) {
+				delegation.summary = summary;
+			}
+			if (confidence !== undefined) {
+				delegation.confidence = confidence;
+			}
+			if (classification !== undefined) {
+				delegation.classification = classification;
+			}
+			projection.delegations.push(delegation);
 			return;
 		}
 		case "validation.completed": {
@@ -401,16 +422,42 @@ export function projectEvents({ runId, events }: { runId: string; events: readon
 	return projection;
 }
 
+type ProjectedDelegation = EventProjection["delegations"][number];
+
+function latestDelegations(delegations: readonly ProjectedDelegation[]): ProjectedDelegation[] {
+	const latestByChild = new Map<string, ProjectedDelegation>();
+	for (const delegation of delegations) {
+		const latest = latestByChild.get(delegation.childId);
+		if (latest === undefined || delegation.sequence > latest.sequence) {
+			latestByChild.set(delegation.childId, delegation);
+		}
+	}
+	return [...latestByChild.values()].sort(
+		(left, right) => left.sequence - right.sequence || left.childId.localeCompare(right.childId),
+	);
+}
+
+function formatDelegationLine(fact: ProjectedDelegation): string {
+	let line = `#${fact.sequence} delegation ${fact.childId}: ${fact.status}; artifacts ${fact.artifactRefs.join(", ") || "(none)"}`;
+	if (fact.summary !== undefined) {
+		line += `; summary ${fact.summary}`;
+	}
+	if (fact.confidence !== undefined) {
+		line += `; confidence ${fact.confidence}`;
+	}
+	if (fact.classification !== undefined) {
+		line += `; classification ${fact.classification}`;
+	}
+	return line;
+}
+
 function factLines(projection: EventProjection): string[] {
 	return [
 		"Loop decision context",
 		`Lifecycle: ${projection.lifecycle.state}${projection.lifecycle.settlement ? ` settlement=${projection.lifecycle.settlement}` : ""} highWater=${projection.lifecycle.highWater}`,
 		`Iteration: ${projection.iteration.used}${projection.iteration.max === undefined ? "" : `/${projection.iteration.max}`}`,
 		`Budget: ${projection.budget.tokensUsed}${projection.budget.tokensMax === undefined ? "" : `/${projection.budget.tokensMax}`}`,
-		...projection.delegations.map(
-			(fact) =>
-				`#${fact.sequence} delegation ${fact.childId}: ${fact.status}; artifacts ${fact.artifactRefs.join(", ") || "(none)"}`,
-		),
+		...latestDelegations(projection.delegations).map(formatDelegationLine),
 		...projection.validations.map((fact) => `#${fact.sequence} validation ${fact.command}: ${fact.outcome}`),
 		...projection.reviews.map(
 			(fact) =>

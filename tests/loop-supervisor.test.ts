@@ -3732,8 +3732,8 @@ test("structured authority publishes only allowlisted fields", async () => {
 			"ALLOWED_BLOCKER",
 			"ALLOWED_CLASSIFICATION",
 		] as const;
-		// Projection intentionally omits terminal summary/confidence/classification until R09A.
 		const allowedProjectionTokens = [
+			"ALLOWED_SUMMARY",
 			"ALLOWED_FILE",
 			"ALLOWED_COMMAND",
 			"ALLOWED_OUTCOME",
@@ -3741,6 +3741,8 @@ test("structured authority publishes only allowlisted fields", async () => {
 			"ALLOWED_FINDING",
 			"ALLOWED_NIT",
 			"ALLOWED_BLOCKER",
+			"0.42",
+			"ALLOWED_CLASSIFICATION",
 		] as const;
 
 		const settlement = deferred();
@@ -3861,12 +3863,15 @@ test("structured authority publishes only allowlisted fields", async () => {
 			for (const surface of [status, prompt]) {
 				const contextStart = surface.indexOf("Loop decision context");
 				assert.ok(contextStart >= 0, "projected context must be present");
-				assert.ok(surface.slice(contextStart).length <= 4000, "projected context must remain bounded");
+				const context = surface.slice(contextStart);
+				assert.ok(context.length <= 4000, "projected context must remain bounded");
 				for (const allowed of [...refs, ...allowedProjectionTokens]) {
-					assert.ok(surface.includes(allowed));
+					assert.ok(context.includes(allowed), `${allowed} must appear in projected context`);
 				}
+				assert.match(context, new RegExp(`delegation ${childId}: completed`));
+				assert.doesNotMatch(context, new RegExp(`delegation ${childId}: (started|running)`));
 				for (const forbidden of forbiddenAuthorityTokens) {
-					assert.equal(surface.includes(forbidden), false);
+					assert.equal(context.includes(forbidden), false);
 				}
 			}
 			await tick();

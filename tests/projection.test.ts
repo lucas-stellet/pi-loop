@@ -261,6 +261,61 @@ test("renderer is bounded, deterministic, whole-line only, and never leaks raw l
 	}
 });
 
+test("renders only the latest allowlisted delegation per child before bounding", () => {
+	const oldArtifact = `old-${"x".repeat(500)}.log`;
+	const events = [
+		event(1, "delegation.updated", { childId: "child-a", status: "started", artifactRefs: [oldArtifact] }),
+		event(2, "delegation.updated", { childId: "child-b", status: "started", artifactRefs: [] }),
+		event(3, "delegation.updated", { childId: "child-a", status: "running", artifactRefs: [] }),
+		event(4, "delegation.updated", {
+			childId: "child-b",
+			status: "running",
+			artifactRefs: ["artifacts/child-b.log"],
+			summary: { malformed: "ignored" },
+			confidence: "not-a-number",
+			classification: ["not-a-string"],
+		}),
+		event(5, "delegation.updated", {
+			childId: "child-a",
+			status: "completed",
+			artifactRefs: ["artifacts/child-a.json"],
+			summary: "EXACT_SUMMARY",
+			confidence: 0,
+			classification: "EXACT_CLASSIFICATION",
+			unknownTopLevelKey: "FORBIDDEN_TOP_LEVEL",
+			nested: { value: "FORBIDDEN_NESTED" },
+			childLog: "FORBIDDEN_CHILD_PROSE",
+			resultArtifactRefs: ["FORBIDDEN_RESULT_REF"],
+		}),
+	];
+
+	const projection = projectEvents({ runId: "run-1", events });
+	assert.deepEqual(projection.delegations, [
+		{ sequence: 1, childId: "child-a", status: "started", artifactRefs: [oldArtifact] },
+		{ sequence: 2, childId: "child-b", status: "started", artifactRefs: [] },
+		{ sequence: 3, childId: "child-a", status: "running", artifactRefs: [] },
+		{ sequence: 4, childId: "child-b", status: "running", artifactRefs: ["artifacts/child-b.log"] },
+		{
+			sequence: 5,
+			childId: "child-a",
+			status: "completed",
+			artifactRefs: ["artifacts/child-a.json"],
+			summary: "EXACT_SUMMARY",
+			confidence: 0,
+			classification: "EXACT_CLASSIFICATION",
+		},
+	]);
+
+	const context = renderDecisionContext(projection, { maxCharacters: 500 });
+	assert.equal(context, renderDecisionContext(projection, { maxCharacters: 500 }));
+	assert.ok(context.length <= 500);
+	assert.match(context, /#4 delegation child-b: running; artifacts artifacts\/child-b\.log/);
+	assert.match(context, /#5 delegation child-a: completed; artifacts artifacts\/child-a\.json.*EXACT_SUMMARY.*0.*EXACT_CLASSIFICATION/);
+	assert.ok(context.indexOf("#4 delegation child-b") < context.indexOf("#5 delegation child-a"));
+	assert.doesNotMatch(context, /#1 delegation child-a|#2 delegation child-b|#3 delegation child-a/);
+	assert.doesNotMatch(context, /FORBIDDEN_TOP_LEVEL|FORBIDDEN_NESTED|FORBIDDEN_CHILD_PROSE|FORBIDDEN_RESULT_REF|old-/);
+});
+
 test("projectRunContext pairs projection with bounded context for the active run", () => {
 	const { projection, context } = projectRunContext({
 		runId: "run-1",
