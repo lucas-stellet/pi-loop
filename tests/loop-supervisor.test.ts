@@ -7,6 +7,7 @@ import { after, before, test } from "node:test";
 
 import { LOOP_CONTROL_FILES } from "../src/constants.ts";
 import { createChildArtifactStore } from "../src/child-artifacts.ts";
+import { validateChildStructuredResult, type ChildStructuredResult } from "../src/child-structured-result.ts";
 import { DelegateCancellationError, type DelegateExecutor } from "../src/delegate-executor.ts";
 import { resolveDelegate, type DelegateMetadata, type DelegateResolver } from "../src/delegate-registry.ts";
 import piLoop from "../index.ts";
@@ -257,6 +258,162 @@ function loopEvents(harness: ReturnType<typeof createHarness>) {
 	return harness.appendEntries
 		.filter((entry) => entry.customType === "loop-event")
 		.map((entry) => entry.data as LoopEvent);
+}
+
+function childRuntimeRefs(childId: string) {
+	return [
+		`children/${childId}/stdout.bin`,
+		`children/${childId}/stderr.bin`,
+		`children/${childId}/structured.bin`,
+	] as const;
+}
+
+function allFieldsStructuredResult(childId: string, artifactRefs: readonly string[]) {
+	const result = validateChildStructuredResult({
+		summary: "structured summary",
+		artifactRefs,
+		filesChanged: ["src/a.ts"],
+		validations: [{ command: "npm test", outcome: "passed" }],
+		review: { verdict: "APPROVE", findings: [] },
+		nits: ["minor"],
+		blockers: ["blocked"],
+		confidence: 0,
+		classification: "complete",
+	});
+	assert.ok(result, `all-fields fixture for ${childId} must validate`);
+	return result;
+}
+
+/** Deterministic lifecycle prefix for a launched child before structured facts/terminal. */
+function childLifecycleEvents(childId: string) {
+	return [
+		["delegation.updated", { childId, status: "started", artifactRefs: [] }],
+		["delegation.updated", { childId, status: "running", artifactRefs: [] }],
+	] as const;
+}
+
+/** Exact typed kinds produced by `allFieldsStructuredResult` in adapter order. */
+const ALL_FIELDS_TYPED_KINDS = [
+	"workspace.changed",
+	"validation.completed",
+	"review.completed",
+	"nit.recorded",
+	"blocker.raised",
+] as const;
+
+/** Exact typed facts produced by `allFieldsStructuredResult` in adapter order. */
+function allFieldsTypedFacts(childId: string) {
+	return [
+		["workspace.changed", { childId, files: ["src/a.ts"] }],
+		["validation.completed", { childId, command: "npm test", outcome: "passed" }],
+		["review.completed", { childId, verdict: "APPROVE", findings: [] }],
+		["nit.recorded", { childId, message: "minor" }],
+		["blocker.raised", { childId, message: "blocked" }],
+	] as const;
+}
+
+/** Enriched completed terminal fields for the all-fields fixture with full runtime refs. */
+function allFieldsCompletedTerminal(childId: string, refs: readonly string[] = childRuntimeRefs(childId)) {
+	return [
+		"delegation.updated",
+		{
+			childId,
+			status: "completed",
+			artifactRefs: [...refs],
+			summary: "structured summary",
+			confidence: 0,
+			classification: "complete",
+			resultArtifactRefs: [refs[2]!],
+		},
+	] as const;
+}
+
+async function readOriginCanonicalEvents(cwd: string, runId: string): Promise<LoopEvent[]> {
+	return (await readFile(join(cwd, ".pi", "loop", runId, "events.jsonl"), "utf8"))
+		.trimEnd().split("\n").map((line) => JSON.parse(line) as LoopEvent);
+}
+
+async function childEventsInStores(
+	cwd: string,
+	runId: string,
+	harness: ReturnType<typeof createHarness>,
+	childId: string,
+): Promise<{ canonical: Array<readonly [unknown, unknown]>; mirror: Array<readonly [unknown, unknown]> }> {
+	const childEvents = (events: LoopEvent[]) => events
+		.filter((event) => (event.payload as { childId?: unknown }).childId === childId)
+		.map((event) => [event.kind, event.payload] as const);
+	return {
+		canonical: childEvents(await readOriginCanonicalEvents(cwd, runId)),
+		mirror: childEvents(loopEvents(harness)),
+	};
+}
+
+async function assertChildEventsInStores(
+	cwd: string,
+	runId: string,
+	harness: ReturnType<typeof createHarness>,
+	childId: string,
+	expected: Array<readonly [unknown, unknown]>,
+	message: string,
+): Promise<void> {
+	const stores = await childEventsInStores(cwd, runId, harness, childId);
+	assert.deepEqual(stores.canonical, expected, message);
+	assert.deepEqual(stores.mirror, expected, message);
+}
+
+type OriginRunPublications = {
+	canonical: LoopEvent[];
+	loopEvents: LoopEvent[];
+	loopStates: unknown[];
+};
+
+async function originRunPublications(
+	cwd: string,
+	runId: string,
+	harness: ReturnType<typeof createHarness>,
+): Promise<OriginRunPublications> {
+	const publications = (customType: string) => harness.appendEntries
+		.filter((entry) => entry.customType === customType && (entry.data as { runId?: unknown }).runId === runId)
+		.map((entry) => JSON.parse(JSON.stringify(entry.data)));
+	return {
+		canonical: await readOriginCanonicalEvents(cwd, runId),
+		loopEvents: publications("loop-event") as LoopEvent[],
+		loopStates: publications("loop-state"),
+	};
+}
+
+function assertPoisonedOriginUnchanged(before: OriginRunPublications, after: OriginRunPublications): void {
+	for (const [label, events] of [
+		["before.canonical", before.canonical],
+		["before.loopEvents", before.loopEvents],
+		["after.canonical", after.canonical],
+		["after.loopEvents", after.loopEvents],
+	] as const) {
+		assert.equal(
+			events.some((event) => event.kind === "loop.paused"),
+			false,
+			`${label} must not contain loop.paused`,
+		);
+	}
+	for (const key of ["canonical", "loopEvents", "loopStates"] as const) {
+		assert.equal(after[key].length, before[key].length, `${key} count must not change after poisoned probe`);
+		assert.deepEqual(after[key], before[key], `${key} content must not change after poisoned probe`);
+	}
+}
+
+/** Capture full-origin pubs, reject poisoned loop_pause, prove no follower growth/mutation. */
+async function assertPoisonedLoopPauseLeavesOriginUnchanged(
+	cwd: string,
+	runId: string,
+	harness: ReturnType<typeof createHarness>,
+): Promise<void> {
+	const before = await originRunPublications(cwd, runId, harness);
+	await assert.rejects(() => executeTool(harness, "loop_pause", {}), /unhealthy/i);
+	assertPoisonedOriginUnchanged(before, await originRunPublications(cwd, runId, harness));
+}
+
+function tick(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
 }
 
 function requiredHandler(
@@ -3018,4 +3175,707 @@ test("summary completion rejects a started-only delegation sequence as semantic 
 		/missing evidence|Requirement 1/i,
 	);
 	assert.equal(lastLoopState(harness).state, "active");
+});
+
+test("loop_delegate rejects ineligible structured authority without adding facts or terminal fields", async () => {
+	const rejected = <T>(reason: unknown): Promise<T> => {
+		const promise = Promise.reject(reason) as Promise<T>;
+		void promise.catch(() => undefined);
+		return promise;
+	};
+	const rows: Array<{
+		name: string;
+		settled: () => Promise<void>;
+		structured: (childId: string, refs: readonly string[]) => Promise<ReturnType<typeof allFieldsStructuredResult> | undefined>;
+		refs: (childId: string) => readonly string[];
+		expectedStatus: "completed" | "failed" | "cancelled";
+	}> = [
+		{
+			name: "failed process",
+			settled: () => rejected(new Error("child failed")),
+			structured: (id, refs) => Promise.resolve(allFieldsStructuredResult(id, [refs[2]!])),
+			refs: childRuntimeRefs,
+			expectedStatus: "failed",
+		},
+		{
+			name: "cancelled process",
+			settled: () => rejected(new DelegateCancellationError("SIGTERM")),
+			structured: (id, refs) => Promise.resolve(allFieldsStructuredResult(id, [refs[2]!])),
+			refs: childRuntimeRefs,
+			expectedStatus: "cancelled",
+		},
+		{
+			name: "undefined result",
+			settled: () => Promise.resolve(),
+			structured: () => Promise.resolve(undefined),
+			refs: childRuntimeRefs,
+			expectedStatus: "completed",
+		},
+		{
+			name: "rejected result",
+			settled: () => Promise.resolve(),
+			structured: () => rejected(new Error("structured infrastructure failure")),
+			refs: childRuntimeRefs,
+			expectedStatus: "failed",
+		},
+		{
+			name: "missing structured runtime ref",
+			settled: () => Promise.resolve(),
+			structured: (id) => Promise.resolve(allFieldsStructuredResult(id, [`children/${id}/structured.bin`])),
+			refs: (id) => childRuntimeRefs(id).slice(0, 2),
+			expectedStatus: "completed",
+		},
+		{
+			name: "duplicate reported ref",
+			settled: () => Promise.resolve(),
+			structured: (id, refs) => Promise.resolve(allFieldsStructuredResult(id, [refs[2]!, refs[2]!])),
+			refs: childRuntimeRefs,
+			expectedStatus: "completed",
+		},
+		{
+			name: "foreign reported ref",
+			settled: () => Promise.resolve(),
+			structured: (id) => Promise.resolve(allFieldsStructuredResult(id, ["children/other/structured.bin"])),
+			refs: childRuntimeRefs,
+			expectedStatus: "completed",
+		},
+		{
+			name: "unsafe reported ref",
+			settled: () => Promise.resolve(),
+			structured: (id) => Promise.resolve(allFieldsStructuredResult(id, ["../structured.bin"])),
+			refs: childRuntimeRefs,
+			expectedStatus: "completed",
+		},
+		{
+			name: "safe same-child non-member reported ref",
+			settled: () => Promise.resolve(),
+			structured: (id) => Promise.resolve(allFieldsStructuredResult(id, [`children/${id}/final.bin`])),
+			refs: childRuntimeRefs,
+			expectedStatus: "completed",
+		},
+	];
+
+	for (const row of rows) {
+		await withTemporaryCwd(async (cwd) => {
+			let childId = "";
+			const unhandled: unknown[] = [];
+			const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+			const harness = createHarness({ cwd });
+			installLoop(harness, { delegateExecutor: { async launch(request) {
+				childId = request.childRunId;
+				const refs = row.refs(childId);
+				return { pid: process.pid + 1, artifactRefs: Promise.resolve(refs), structuredResult: row.structured(childId, refs), settled: row.settled() };
+			} } });
+			process.on("unhandledRejection", onUnhandled);
+			try {
+				await executeTool(harness, "loop_start", { objective: `Reject ${row.name}` });
+				const runId = lastLoopState(harness).runId as string;
+				await executeTool(harness, "loop_delegate", { name: "delegate", task: "caller prose is not authority" });
+				await waitUntil(() => loopEvents(harness).some((event) => event.kind === "delegation.updated"
+					&& (event.payload as { childId?: unknown; status?: unknown }).childId === childId
+					&& (event.payload as { status?: unknown }).status === row.expectedStatus), `${row.name} terminal was not published`);
+				await assertChildEventsInStores(cwd, runId, harness, childId, [
+					["delegation.updated", { childId, status: "started", artifactRefs: [] }],
+					["delegation.updated", { childId, status: "running", artifactRefs: [] }],
+					["delegation.updated", { childId, status: row.expectedStatus, artifactRefs: [...row.refs(childId)] }],
+				], row.name);
+				await tick();
+				assert.deepEqual(unhandled, [], `${row.name} must not leak detached rejection`);
+			} finally {
+				process.off("unhandledRejection", onUnhandled);
+			}
+		});
+	}
+});
+
+test("loop_delegate gates structured authority on all three structured child promises", async () => {
+	const orders = [
+		["settled", "artifactRefs", "structuredResult"],
+		["settled", "structuredResult", "artifactRefs"],
+		["artifactRefs", "settled", "structuredResult"],
+		["artifactRefs", "structuredResult", "settled"],
+		["structuredResult", "settled", "artifactRefs"],
+		["structuredResult", "artifactRefs", "settled"],
+	] as const;
+	assert.equal(new Set(orders.map((order) => order.join(","))).size, 6);
+	let executed = 0;
+	for (const order of orders) {
+		await withTemporaryCwd(async (cwd) => {
+			const settlement = deferred();
+			const refsCompletion = deferred<readonly string[]>();
+			const structuredCompletion = deferred<ReturnType<typeof allFieldsStructuredResult>>();
+			let childId = "";
+			const harness = createHarness({ cwd });
+			installLoop(harness, { delegateExecutor: { async launch(request) {
+				childId = request.childRunId;
+				return { pid: process.pid + 1, artifactRefs: refsCompletion.promise, structuredResult: structuredCompletion.promise, settled: settlement.promise };
+			} } });
+			await executeTool(harness, "loop_start", { objective: `Gate ${order.join(" then ")}` });
+			const runId = lastLoopState(harness).runId as string;
+			await executeTool(harness, "loop_delegate", { name: "delegate", task: "opaque prose must not be authority" });
+			const refs = childRuntimeRefs(childId);
+			const structuredRef = refs[2];
+			const beforeCompletion: Array<readonly [unknown, unknown]> = [
+				["delegation.updated", { childId, status: "started", artifactRefs: [] }],
+				["delegation.updated", { childId, status: "running", artifactRefs: [] }],
+			];
+			const release = {
+				settled: () => settlement.resolve(),
+				artifactRefs: () => refsCompletion.resolve(refs),
+				structuredResult: () => structuredCompletion.resolve(allFieldsStructuredResult(childId, [structuredRef])),
+			};
+			for (const [index, gate] of order.entries()) {
+				release[gate]();
+				await tick();
+				if (index < 2) await assertChildEventsInStores(cwd, runId, harness, childId, beforeCompletion, `${order.join(" → ")} gate ${index + 1}`);
+			}
+			await waitUntil(() => loopEvents(harness).some((event) => event.kind === "delegation.updated"
+				&& (event.payload as { childId?: unknown; status?: unknown }).childId === childId
+				&& (event.payload as { status?: unknown }).status === "completed"), `${order.join(" → ")} did not complete`);
+			await assertChildEventsInStores(cwd, runId, harness, childId, [
+				...beforeCompletion,
+				["workspace.changed", { childId, files: ["src/a.ts"] }],
+				["validation.completed", { childId, command: "npm test", outcome: "passed" }],
+				["review.completed", { childId, verdict: "APPROVE", findings: [] }],
+				["nit.recorded", { childId, message: "minor" }],
+				["blocker.raised", { childId, message: "blocked" }],
+				["delegation.updated", {
+					childId,
+					status: "completed",
+					artifactRefs: [...refs],
+					summary: "structured summary",
+					confidence: 0,
+					classification: "complete",
+					resultArtifactRefs: [structuredRef],
+				}],
+			], order.join(" → "));
+			executed += 1;
+		});
+	}
+	assert.equal(executed, 6);
+});
+
+test("loop_delegate gates a late rejected structured child promise among three structured child promises without unhandled rejection", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		const settlement = deferred();
+		const refsCompletion = deferred<readonly string[]>();
+		const structuredCompletion = deferred<ReturnType<typeof allFieldsStructuredResult>>();
+		let childId = "";
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+		const harness = createHarness({ cwd });
+		installLoop(harness, { delegateExecutor: { async launch(request) {
+			childId = request.childRunId;
+			return { pid: process.pid + 1, artifactRefs: refsCompletion.promise, structuredResult: structuredCompletion.promise, settled: settlement.promise };
+		} } });
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await executeTool(harness, "loop_start", { objective: "Reject late structured authority" });
+			const runId = lastLoopState(harness).runId as string;
+			await executeTool(harness, "loop_delegate", { name: "delegate", task: "opaque prose must not be authority" });
+			const refs = childRuntimeRefs(childId);
+			settlement.resolve();
+			await tick();
+			refsCompletion.resolve(refs);
+			await tick();
+			await assertChildEventsInStores(cwd, runId, harness, childId, [
+				["delegation.updated", { childId, status: "started", artifactRefs: [] }],
+				["delegation.updated", { childId, status: "running", artifactRefs: [] }],
+			], "process and refs must not publish authority");
+			structuredCompletion.reject(new Error("late structured infrastructure failure"));
+			await waitUntil(() => loopEvents(harness).some((event) => event.kind === "delegation.updated"
+				&& (event.payload as { childId?: unknown; status?: unknown }).childId === childId
+				&& (event.payload as { status?: unknown }).status === "failed"), "late structured rejection was not published");
+			await assertChildEventsInStores(cwd, runId, harness, childId, [
+				["delegation.updated", { childId, status: "started", artifactRefs: [] }],
+				["delegation.updated", { childId, status: "running", artifactRefs: [] }],
+				["delegation.updated", { childId, status: "failed", artifactRefs: [...refs] }],
+			], "late structured rejection");
+			await tick();
+			assert.deepEqual(unhandled, []);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+});
+
+test("loop_delegate structured typed fact failures fail closed at every canonical and Pi mirror stage", async () => {
+	let executed = 0;
+	for (const kind of ALL_FIELDS_TYPED_KINDS) for (const stage of ["canonical write", "Pi mirror"] as const) {
+		await withTemporaryCwd(async (cwd) => {
+			let childId = "";
+			let active = false;
+			let injections = 0;
+			const unhandled: unknown[] = [];
+			const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+			const harness = createHarness({ cwd, onAppendEntry(customType, data) {
+				const event = data as LoopEvent;
+				if (active && stage === "Pi mirror" && customType === "loop-event" && event.kind === kind) {
+					injections += 1;
+					throw new Error(`${kind} mirror failed`);
+				}
+			} });
+			installLoop(harness, { delegateExecutor: { async launch(request) {
+				childId = request.childRunId;
+				const refs = childRuntimeRefs(childId);
+				return { pid: process.pid + 1, artifactRefs: Promise.resolve(refs), structuredResult: Promise.resolve(allFieldsStructuredResult(childId, [refs[2]!])), settled: Promise.resolve() };
+			} } });
+			process.on("unhandledRejection", onUnhandled);
+			try {
+				await withFileHandleMethod("writeFile", (original) => async function writeFile(this: FileHandle, data: string | Uint8Array, options?: unknown) {
+					const text = typeof data === "string" ? data : Buffer.from(data).toString("utf8");
+					if (active && stage === "canonical write" && text.includes(`"kind":"${kind}"`)) {
+						injections += 1;
+						throw new Error(`${kind} write failed`);
+					}
+					return (original as (data: string | Uint8Array, options?: unknown) => Promise<void>).call(this, data, options);
+				}, async () => {
+					await executeTool(harness, "loop_start", { objective: `${kind} ${stage}` });
+					const runId = lastLoopState(harness).runId as string;
+					active = true;
+					await executeTool(harness, "loop_delegate", { name: "delegate", task: "publish structured facts" });
+					await waitUntil(() => injections === 1, `${kind} ${stage} was not injected`);
+					await tick();
+					const typed = allFieldsTypedFacts(childId);
+					const target = ALL_FIELDS_TYPED_KINDS.indexOf(kind);
+					const lifecycle = childLifecycleEvents(childId);
+					const stores = await childEventsInStores(cwd, runId, harness, childId);
+					assert.equal(injections, 1);
+					assert.deepEqual(stores.canonical, [...lifecycle, ...typed.slice(0, target + (stage === "Pi mirror" ? 1 : 0))]);
+					assert.deepEqual(stores.mirror, [...lifecycle, ...typed.slice(0, target)]);
+					await assertPoisonedLoopPauseLeavesOriginUnchanged(cwd, runId, harness);
+					assert.deepEqual(await childEventsInStores(cwd, runId, harness, childId), stores);
+					assert.deepEqual(unhandled, []);
+				});
+			} finally {
+				process.off("unhandledRejection", onUnhandled);
+			}
+		});
+		executed += 1;
+	}
+	assert.equal(executed, 10);
+});
+
+test("loop_delegate enriched structured terminal failures retain only stage-committed authority", async () => {
+	const stages = ["canonical write", "terminal sync", "Pi mirror"] as const;
+	let executed = 0;
+	for (const stage of stages) {
+		await withTemporaryCwd(async (cwd) => {
+			let childId = "";
+			let active = false;
+			let terminalWritten = false;
+			let injections = 0;
+			const unhandled: unknown[] = [];
+			const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+			const harness = createHarness({ cwd, onAppendEntry(customType, data) {
+				const event = data as LoopEvent;
+				if (
+					active
+					&& stage === "Pi mirror"
+					&& customType === "loop-event"
+					&& event.kind === "delegation.updated"
+					&& (event.payload as { status?: unknown }).status === "completed"
+				) {
+					injections += 1;
+					throw new Error("completed mirror failed");
+				}
+			} });
+			installLoop(harness, { delegateExecutor: { async launch(request) {
+				childId = request.childRunId;
+				const refs = childRuntimeRefs(childId);
+				return { pid: process.pid + 1, artifactRefs: Promise.resolve(refs), structuredResult: Promise.resolve(allFieldsStructuredResult(childId, [refs[2]!])), settled: Promise.resolve() };
+			} } });
+			process.on("unhandledRejection", onUnhandled);
+			try {
+				await withFileHandleMethod("writeFile", (original) => async function writeFile(this: FileHandle, data: string | Uint8Array, options?: unknown) {
+					const text = typeof data === "string" ? data : Buffer.from(data).toString("utf8");
+					const isEnrichedTerminal = active
+						&& text.includes('"kind":"delegation.updated"')
+						&& text.includes('"status":"completed"')
+						&& text.includes('"summary":"structured summary"');
+					if (isEnrichedTerminal) {
+						if (stage === "canonical write") {
+							injections += 1;
+							throw new Error("completed write failed");
+						}
+						terminalWritten = true;
+					}
+					return (original as (data: string | Uint8Array, options?: unknown) => Promise<void>).call(this, data, options);
+				}, async () => {
+					await withFileHandleMethod("sync", (original) => async function sync(this: FileHandle) {
+						if (terminalWritten && stage === "terminal sync") {
+							injections += 1;
+							throw new Error("completed sync failed");
+						}
+						return (original as () => Promise<void>).call(this);
+					}, async () => {
+						await executeTool(harness, "loop_start", { objective: `completed ${stage}` });
+						const runId = lastLoopState(harness).runId as string;
+						active = true;
+						await executeTool(harness, "loop_delegate", { name: "delegate", task: "publish completed structured terminal" });
+						await waitUntil(() => injections === 1, `${stage} was not injected`);
+						await tick();
+						const typed = allFieldsTypedFacts(childId);
+						const lifecycle = childLifecycleEvents(childId);
+						const terminal = allFieldsCompletedTerminal(childId);
+						const stores = await childEventsInStores(cwd, runId, harness, childId);
+						assert.equal(injections, 1);
+						assert.deepEqual(
+							stores.canonical,
+							stage === "canonical write" ? [...lifecycle, ...typed] : [...lifecycle, ...typed, terminal],
+						);
+						assert.deepEqual(stores.mirror, [...lifecycle, ...typed]);
+						await assertPoisonedLoopPauseLeavesOriginUnchanged(cwd, runId, harness);
+						assert.deepEqual(await childEventsInStores(cwd, runId, harness, childId), stores);
+						assert.deepEqual(unhandled, []);
+					});
+				});
+			} finally {
+				process.off("unhandledRejection", onUnhandled);
+			}
+		});
+		executed += 1;
+	}
+	assert.equal(executed, 3);
+});
+
+test("structured authority remains on originating run after clear/start B", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		const settlement = deferred();
+		const refsCompletion = deferred<readonly string[]>();
+		const structuredCompletion = deferred<ReturnType<typeof allFieldsStructuredResult>>();
+		let childId = "";
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+		const harness = createHarness({ cwd });
+		installLoop(harness, { delegateExecutor: { async launch(request) {
+			childId = request.childRunId;
+			return {
+				pid: process.pid + 1,
+				artifactRefs: refsCompletion.promise,
+				structuredResult: structuredCompletion.promise,
+				settled: settlement.promise,
+			};
+		} } });
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await executeTool(harness, "loop_start", { objective: "Run A owns late structured authority" });
+			const runA = lastLoopState(harness).runId as string;
+			await executeTool(harness, "loop_delegate", { name: "delegate", task: "Publish all structured facts late" });
+			const refs = childRuntimeRefs(childId);
+			await assertChildEventsInStores(cwd, runA, harness, childId, [...childLifecycleEvents(childId)], "A before clear");
+
+			await executeTool(harness, "loop_clear", {});
+			await executeTool(harness, "loop_start", { objective: "Run B remains uncontaminated" });
+			const runB = lastLoopState(harness).runId as string;
+			assert.notEqual(runB, runA);
+			const bBefore = await originRunPublications(cwd, runB, harness);
+			const bSequenceBefore = lastLoopState(harness).sequence;
+
+			settlement.resolve();
+			refsCompletion.resolve(refs);
+			structuredCompletion.resolve(allFieldsStructuredResult(childId, [refs[2]!]));
+			await waitUntil(() => loopEvents(harness).some((event) => event.runId === runA
+				&& event.kind === "delegation.updated"
+				&& (event.payload as { childId?: unknown; status?: unknown }).childId === childId
+				&& (event.payload as { status?: unknown }).status === "completed"), "late A terminal was not published");
+
+			const expected = [...childLifecycleEvents(childId), ...allFieldsTypedFacts(childId), allFieldsCompletedTerminal(childId, refs)];
+			await assertChildEventsInStores(cwd, runA, harness, childId, expected, "late A structured authority");
+			const bAfter = await originRunPublications(cwd, runB, harness);
+			assert.deepEqual(bAfter.canonical, bBefore.canonical, "late A publication must not change B canonical events");
+			assert.deepEqual(bAfter.loopEvents, bBefore.loopEvents, "late A publication must not change B mirrors");
+			assert.deepEqual(bAfter.loopStates, bBefore.loopStates, "late A publication must not change B snapshots");
+			assert.equal(lastLoopState(harness).sequence, bSequenceBefore, "late A publication must not advance B sequence");
+			const bSurfaces = JSON.stringify({
+				...bAfter,
+				status: resultText(await executeTool(harness, "loop_status", {})),
+				prompt: await requiredHandler(harness, "before_agent_start", "B prompt hook required")({ type: "before_agent_start" }, harness.ctx),
+			});
+			for (const sentinel of [childId, ...refs, "structured summary", "src/a.ts", "npm test", "APPROVE", "minor", "blocked", "complete"]) {
+				assert.equal(bSurfaces.includes(sentinel), false, `B surfaces must not contain A sentinel ${sentinel}`);
+			}
+			await tick();
+			assert.deepEqual(unhandled, []);
+		} finally {
+			settlement.resolve();
+			refsCompletion.resolve([]);
+			structuredCompletion.resolve(undefined as never);
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+});
+
+test("structured adaptation resists post-plan mutation", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		const settlement = deferred();
+		const refsCompletion = deferred<readonly string[]>();
+		const structuredCompletion = deferred<ChildStructuredResult>();
+		let childId = "";
+		let releaseWrite!: () => void;
+		const writeReleased = new Promise<void>((resolve) => { releaseWrite = resolve; });
+		let gateHits = 0;
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+		const runtimeRefs: string[] = [];
+		const result: {
+			summary: string; artifactRefs: string[]; filesChanged: string[];
+			validations: Array<{ command: string; outcome: string }>;
+			review: { verdict: string; findings: string[] }; nits: string[]; blockers: string[];
+			confidence: number; classification: string;
+		} = {
+			summary: "before summary", artifactRefs: [], filesChanged: ["before-workspace.ts"],
+			validations: [{ command: "before-command", outcome: "before-outcome" }],
+			review: { verdict: "BEFORE_VERDICT", findings: ["before-finding"] }, nits: ["before-nit"], blockers: ["before-blocker"],
+			confidence: 0.25, classification: "before-classification",
+		};
+		const harness = createHarness({ cwd });
+		installLoop(harness, { delegateExecutor: { async launch(request) {
+			childId = request.childRunId;
+			runtimeRefs.push(`children/${childId}/stdout.bin`, `children/${childId}/stderr.bin`, `children/${childId}/structured.bin`);
+			result.artifactRefs.push(runtimeRefs[2]!);
+			return { pid: process.pid + 1, artifactRefs: refsCompletion.promise, structuredResult: structuredCompletion.promise, settled: settlement.promise };
+		} } });
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await withFileHandleMethod("writeFile", (original) => async function writeFile(this: FileHandle, data: string | Uint8Array, options?: unknown) {
+				const text = typeof data === "string" ? data : Buffer.from(data).toString("utf8");
+				if (text.includes('"kind":"workspace.changed"') && text.includes("before-workspace.ts")) {
+					gateHits += 1;
+					await writeReleased;
+				}
+				return (original as (data: string | Uint8Array, options?: unknown) => Promise<void>).call(this, data, options);
+			}, async () => {
+				await executeTool(harness, "loop_start", { objective: "Defend planned structured authority" });
+				const runId = lastLoopState(harness).runId as string;
+				await executeTool(harness, "loop_delegate", { name: "delegate", task: "Publish mutable all-fields result" });
+				const preRefs = [...runtimeRefs];
+				const expected: Array<readonly [unknown, unknown]> = [
+					...childLifecycleEvents(childId),
+					["workspace.changed", { childId, files: ["before-workspace.ts"] }],
+					["validation.completed", { childId, command: "before-command", outcome: "before-outcome" }],
+					["review.completed", { childId, verdict: "BEFORE_VERDICT", findings: ["before-finding"] }],
+					["nit.recorded", { childId, message: "before-nit" }],
+					["blocker.raised", { childId, message: "before-blocker" }],
+					["delegation.updated", { childId, status: "completed", artifactRefs: preRefs, summary: "before summary", confidence: 0.25, classification: "before-classification", resultArtifactRefs: [preRefs[2]!] }],
+				];
+				settlement.resolve();
+				refsCompletion.resolve(runtimeRefs);
+				structuredCompletion.resolve(result as ChildStructuredResult);
+				await waitUntil(() => gateHits === 1, "canonical workspace append did not enter mutation gate");
+				assert.equal(gateHits, 1, "only the canonical pre-mutation workspace append may enter the gate");
+				const mutate = (tag: string) => {
+					runtimeRefs.splice(0, runtimeRefs.length, `${tag}-runtime`);
+					result.artifactRefs.splice(0, result.artifactRefs.length, `${tag}-result`);
+					result.filesChanged.splice(0, result.filesChanged.length, `${tag}-file`);
+					result.validations[0]!.command = `${tag}-command`; result.validations[0]!.outcome = `${tag}-outcome`;
+					result.validations.splice(0, result.validations.length, { command: `${tag}-replacement-command`, outcome: `${tag}-replacement-outcome` });
+					result.review.verdict = `${tag}-verdict`; result.review.findings.splice(0, result.review.findings.length, `${tag}-finding`);
+					result.nits.splice(0, result.nits.length, `${tag}-nit`); result.blockers.splice(0, result.blockers.length, `${tag}-blocker`);
+					result.summary = `${tag}-summary`; result.confidence = 0.75; result.classification = `${tag}-classification`;
+				};
+				mutate("first-mutation");
+				releaseWrite();
+				await waitUntil(() => loopEvents(harness).some((event) => event.runId === runId && event.kind === "delegation.updated"
+					&& (event.payload as { childId?: unknown; status?: unknown }).childId === childId
+					&& (event.payload as { status?: unknown }).status === "completed"), "mutated child terminal was not published");
+				await assertChildEventsInStores(cwd, runId, harness, childId, expected, "post-plan mutation must not rewrite authority");
+				assert.equal(gateHits, 1, "the mutation gate must block exactly one canonical workspace append");
+				mutate("second-mutation");
+				await tick();
+				await assertChildEventsInStores(cwd, runId, harness, childId, expected, "post-terminal mutation must not rewrite authority");
+				const persisted = JSON.stringify({ canonical: await readOriginCanonicalEvents(cwd, runId), mirrors: loopEvents(harness).filter((event) => event.runId === runId) });
+				assert.equal(/first-mutation|second-mutation/.test(persisted), false, "no mutation sentinel may become journal authority");
+				assert.deepEqual(unhandled, []);
+			});
+		} finally {
+			releaseWrite();
+			settlement.resolve();
+			refsCompletion.resolve([]);
+			structuredCompletion.resolve(undefined as never);
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+});
+
+test("structured authority publishes only allowlisted fields", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		// Distinct positive/negative tokens keep Matrix F non-vacuous across stores and surfaces.
+		const forbiddenAuthorityTokens = [
+			"FORBIDDEN_CALLER_PROSE",
+			"FORBIDDEN_NESTED_VALUE",
+			"FORBIDDEN_REVIEW_VALUE",
+			"FORBIDDEN_RAW_WRAPPER",
+			"FORBIDDEN_FINAL_PROSE",
+			"unknownTopLevelKey",
+			"unknownNestedKey",
+			"finalLikeProse",
+		] as const;
+		const immediateAbsentTokens = [
+			"FORBIDDEN_CALLER_PROSE",
+			"artifactRefs",
+			"summary",
+			"confidence",
+			"classification",
+			"resultArtifactRefs",
+			"ALLOWED_SUMMARY",
+			"ALLOWED_FILE",
+		] as const;
+		const allowedAuthorityTokens = [
+			"ALLOWED_SUMMARY",
+			"ALLOWED_FILE",
+			"ALLOWED_COMMAND",
+			"ALLOWED_OUTCOME",
+			"ALLOWED_VERDICT",
+			"ALLOWED_FINDING",
+			"ALLOWED_NIT",
+			"ALLOWED_BLOCKER",
+			"ALLOWED_CLASSIFICATION",
+		] as const;
+		// Projection intentionally omits terminal summary/confidence/classification until R09A.
+		const allowedProjectionTokens = [
+			"ALLOWED_FILE",
+			"ALLOWED_COMMAND",
+			"ALLOWED_OUTCOME",
+			"ALLOWED_VERDICT",
+			"ALLOWED_FINDING",
+			"ALLOWED_NIT",
+			"ALLOWED_BLOCKER",
+		] as const;
+
+		const settlement = deferred();
+		const refsCompletion = deferred<readonly string[]>();
+		const structuredCompletion = deferred<ChildStructuredResult>();
+		let childId = "";
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+		const harness = createHarness({ cwd });
+		installLoop(harness, { delegateExecutor: { async launch(request) {
+			childId = request.childRunId;
+			return {
+				pid: process.pid + 1,
+				artifactRefs: refsCompletion.promise,
+				structuredResult: structuredCompletion.promise,
+				settled: settlement.promise,
+			};
+		} } });
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await executeTool(harness, "loop_start", { objective: "Matrix F eligible authority" });
+			const runId = lastLoopState(harness).runId as string;
+			const immediate = await executeTool(harness, "loop_delegate", { name: "delegate", task: "FORBIDDEN_CALLER_PROSE" });
+			assert.deepEqual(immediate.details, { childRunId: childId });
+			const immediateSerialized = JSON.stringify(immediate);
+			for (const absent of immediateAbsentTokens) {
+				assert.equal(immediateSerialized.includes(absent), false);
+			}
+
+			const refs = [
+				`children/${childId}/stdout.bin`,
+				`children/${childId}/stderr.bin`,
+				`children/${childId}/final.bin`,
+				`children/${childId}/structured.bin`,
+			];
+			// Explicit cast only: extra keys must reach the adapter, not R08A validation.
+			const result = {
+				summary: "ALLOWED_SUMMARY",
+				artifactRefs: [refs[3]],
+				filesChanged: ["ALLOWED_FILE"],
+				validations: [{
+					command: "ALLOWED_COMMAND",
+					outcome: "ALLOWED_OUTCOME",
+					unknownNestedKey: "FORBIDDEN_NESTED_VALUE",
+				}],
+				review: {
+					verdict: "ALLOWED_VERDICT",
+					findings: ["ALLOWED_FINDING"],
+					unknownNestedKey: "FORBIDDEN_REVIEW_VALUE",
+				},
+				nits: ["ALLOWED_NIT"],
+				blockers: ["ALLOWED_BLOCKER"],
+				confidence: 0.42,
+				classification: "ALLOWED_CLASSIFICATION",
+				unknownTopLevelKey: "FORBIDDEN_RAW_WRAPPER",
+				finalLikeProse: "FORBIDDEN_FINAL_PROSE",
+			} as unknown as ChildStructuredResult;
+			settlement.resolve();
+			refsCompletion.resolve(refs);
+			await tick();
+			await assertChildEventsInStores(
+				cwd,
+				runId,
+				harness,
+				childId,
+				[...childLifecycleEvents(childId)],
+				"two settled promises must not publish authority",
+			);
+			structuredCompletion.resolve(result);
+			await waitUntil(() => loopEvents(harness).some((event) => event.runId === runId
+				&& event.kind === "delegation.updated"
+				&& (event.payload as { childId?: unknown; status?: unknown }).childId === childId
+				&& (event.payload as { status?: unknown }).status === "completed"), "eligible terminal was not published");
+
+			const expected: Array<readonly [unknown, unknown]> = [
+				...childLifecycleEvents(childId),
+				["workspace.changed", { childId, files: ["ALLOWED_FILE"] }],
+				["validation.completed", { childId, command: "ALLOWED_COMMAND", outcome: "ALLOWED_OUTCOME" }],
+				["review.completed", { childId, verdict: "ALLOWED_VERDICT", findings: ["ALLOWED_FINDING"] }],
+				["nit.recorded", { childId, message: "ALLOWED_NIT" }],
+				["blocker.raised", { childId, message: "ALLOWED_BLOCKER" }],
+				["delegation.updated", {
+					childId,
+					status: "completed",
+					artifactRefs: refs,
+					summary: "ALLOWED_SUMMARY",
+					confidence: 0.42,
+					classification: "ALLOWED_CLASSIFICATION",
+					resultArtifactRefs: [refs[3]],
+				}],
+			];
+			// Exact payload deep equality is the payload-key allowlist for each kind.
+			await assertChildEventsInStores(
+				cwd,
+				runId,
+				harness,
+				childId,
+				expected,
+				"canonical JSONL and loop-event mirrors must be exact",
+			);
+			// Authority surfaces only: canonical JSONL + customType loop-event mirrors (not loop-delegation).
+			const canonical = await readOriginCanonicalEvents(cwd, runId);
+			const mirrors = loopEvents(harness).filter((event) => event.runId === runId);
+			for (const events of [canonical, mirrors]) {
+				const serialized = JSON.stringify(events);
+				for (const allowed of [...refs, ...allowedAuthorityTokens]) {
+					assert.ok(serialized.includes(allowed));
+				}
+				for (const forbidden of forbiddenAuthorityTokens) {
+					assert.equal(serialized.includes(forbidden), false, `${forbidden} must not be authority`);
+				}
+			}
+			const status = resultText(await executeTool(harness, "loop_status", {}));
+			const prompt = (await requiredHandler(harness, "before_agent_start", "prompt hook required")(
+				{ type: "before_agent_start" },
+				harness.ctx,
+			) as { systemPrompt: string }).systemPrompt;
+			for (const surface of [status, prompt]) {
+				const contextStart = surface.indexOf("Loop decision context");
+				assert.ok(contextStart >= 0, "projected context must be present");
+				assert.ok(surface.slice(contextStart).length <= 4000, "projected context must remain bounded");
+				for (const allowed of [...refs, ...allowedProjectionTokens]) {
+					assert.ok(surface.includes(allowed));
+				}
+				for (const forbidden of forbiddenAuthorityTokens) {
+					assert.equal(surface.includes(forbidden), false);
+				}
+			}
+			await tick();
+			assert.deepEqual(unhandled, []);
+		} finally {
+			settlement.resolve();
+			refsCompletion.resolve([]);
+			structuredCompletion.resolve(undefined as never);
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
 });

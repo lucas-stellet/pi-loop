@@ -23,6 +23,7 @@ import {
 	type ProjectableEvent,
 } from "./src/projection.ts";
 import { textResult } from "./src/tool-result.ts";
+import { adaptChildStructuredResult } from "./src/child-result-adapter.ts";
 import { createPiDelegateExecutor, DelegateCancellationError, type DelegateExecutor } from "./src/delegate-executor.ts";
 import { resolveDelegate, type DelegateResolver } from "./src/delegate-registry.ts";
 
@@ -49,6 +50,11 @@ type LoopEventKind =
 	| "loop.guardrail_violation"
 	| "loop.iteration"
 	| "delegation.updated"
+	| "workspace.changed"
+	| "validation.completed"
+	| "review.completed"
+	| "nit.recorded"
+	| "blocker.raised"
 	| "supervisor.assessment";
 
 type LoopEventPayload = Record<string, unknown>;
@@ -521,11 +527,13 @@ export default function piLoop(
 			const publishLifecycle = async (
 				status: "running" | "completed" | "failed" | "cancelled",
 				artifactRefs: readonly string[] = [],
+				terminalFields: Record<string, unknown> = {},
 			) => {
 				await appendLoopEvent("delegation.updated", {
 					childId: origin.childRunId,
 					status,
 					artifactRefs: [...artifactRefs],
+					...terminalFields,
 				}, loopState, originChannel);
 				persistIfCurrent();
 			};
@@ -539,19 +547,32 @@ export default function piLoop(
 			try {
 				const handle = await delegateExecutor.launch({ parentRunId: origin.parentRunId, childRunId: origin.childRunId, cwd: ctx.cwd, task: params.task, metadata });
 				await publishLifecycle("running");
-				void Promise.allSettled([handle.settled, handle.artifactRefs]).then(([settled, refs]) => {
+				void Promise.allSettled([handle.settled, handle.artifactRefs, handle.structuredResult]).then(async ([settled, refs, structured]) => {
 					const artifactRefs = refs.status === "fulfilled"
 						? validatedArtifactRefs(refs.value, origin.childRunId)
 						: undefined;
 					if (!artifactRefs) {
 						return publishLifecycle("failed");
 					}
+					if (structured.status === "rejected") {
+						return publishLifecycle("failed", artifactRefs);
+					}
 					const status = settled.status === "fulfilled"
 						? "completed"
 						: settled.reason instanceof DelegateCancellationError
 							? "cancelled"
 							: "failed";
-					return publishLifecycle(status, artifactRefs);
+					if (status !== "completed" || !structured.value) {
+						return publishLifecycle(status, artifactRefs);
+					}
+					const plan = adaptChildStructuredResult(structured.value, origin.childRunId, artifactRefs);
+					if (!plan) {
+						return publishLifecycle(status, artifactRefs);
+					}
+					for (const fact of plan.facts) {
+						await appendLoopEvent(fact.kind, fact.payload, loopState, originChannel);
+					}
+					return publishLifecycle(status, artifactRefs, plan.terminalFields);
 				}).catch(() => undefined);
 			} catch (error) {
 				await publishLifecycle("failed");
