@@ -3128,7 +3128,7 @@ test("loop_complete journals assessments and rejects missing or cross-run event 
 					// Missing assessment for requirement 2 intentionally omitted after first only — actually both needed.
 				],
 			}),
-		/Requirement 2|missing an assessment/i,
+		/missing or cross-run event sequence 1/i,
 	);
 
 	await assert.rejects(
@@ -3175,6 +3175,85 @@ test("summary completion rejects a started-only delegation sequence as semantic 
 		/missing evidence|Requirement 1/i,
 	);
 	assert.equal(lastLoopState(harness).state, "active");
+});
+
+test("summary completion rejects operational event evidence and leaves the loop active", async () => {
+	const harness = createHarness();
+	installLoop(harness);
+	await executeTool(harness, "loop_start", { objective: "Requirements:\n1. Ship the feature." });
+	const startedSequence = loopEvents(harness).find((event) => event.kind === "loop.started")?.sequence;
+	assert.equal(typeof startedSequence, "number");
+
+	await assert.rejects(
+		() => executeTool(harness, "loop_complete", {
+			summary: `Requirement 1: verified. Evidence: #${startedSequence}.`,
+		}),
+		/missing evidence|Requirement 1/i,
+	);
+	assert.equal(lastLoopState(harness).state, "active");
+});
+
+test("assessment completion rejects operational event provenance and leaves the loop active", async () => {
+	const harness = createHarness();
+	installLoop(harness);
+	await executeTool(harness, "loop_start", { objective: "Requirements:\n1. Ship the feature." });
+	await executeTool(harness, "loop_write", { file: "evidence.md", content: "safe evidence" });
+	const startedSequence = loopEvents(harness).find((event) => event.kind === "loop.started")?.sequence;
+	assert.equal(typeof startedSequence, "number");
+
+	await assert.rejects(
+		() => executeTool(harness, "loop_complete", {
+			summary: "Requirement 1: verified. Evidence: evidence.md.",
+			assessments: [{ requirementId: "1", verdict: "satisfied", eventSequences: [startedSequence] }],
+		}),
+		/missing or cross-run event sequence/i,
+	);
+	assert.equal(lastLoopState(harness).state, "active");
+});
+
+test("loop_complete accepts completed delegation and typed child facts as provenance", async () => {
+	const settlement = deferred();
+	const refsCompletion = deferred<readonly string[]>();
+	const structuredCompletion = deferred<ReturnType<typeof allFieldsStructuredResult>>();
+	let childId = "";
+	const harness = createHarness();
+	installLoop(harness, { delegateExecutor: { async launch(request) {
+		childId = request.childRunId;
+		return { pid: process.pid + 1, artifactRefs: refsCompletion.promise, structuredResult: structuredCompletion.promise, settled: settlement.promise };
+	} } });
+	await executeTool(harness, "loop_start", { objective: "Requirements:\n1. Ship the feature." });
+	const runId = lastLoopState(harness).runId as string;
+
+	await executeTool(harness, "loop_delegate", { name: "delegate", task: "Ship it" });
+	assert.equal(loopEvents(harness).some((event) => event.kind === "delegation.updated"
+		&& (event.payload as { status?: unknown }).status === "completed"), false);
+	const refs = childRuntimeRefs(childId);
+	settlement.resolve();
+	refsCompletion.resolve(refs);
+	structuredCompletion.resolve(allFieldsStructuredResult(childId, [refs[2]! ]));
+	await waitUntil(() => loopEvents(harness).some((event) => event.kind === "delegation.updated"
+		&& (event.payload as { childId?: unknown; status?: unknown }).childId === childId
+		&& (event.payload as { status?: unknown }).status === "completed"), "completed child was not published");
+	const completedSequence = loopEvents(harness).find((event) => event.kind === "delegation.updated"
+		&& (event.payload as { childId?: unknown; status?: unknown }).childId === childId
+		&& (event.payload as { status?: unknown }).status === "completed")?.sequence;
+	const validationSequence = loopEvents(harness).find((event) => event.kind === "validation.completed")?.sequence;
+	assert.equal(typeof completedSequence, "number");
+	assert.equal(typeof validationSequence, "number");
+
+	await executeTool(harness, "loop_complete", {
+		summary: `Requirement 1: verified. Evidence: #${completedSequence}, #${validationSequence}.`,
+		assessments: [{ requirementId: "1", verdict: "satisfied", eventSequences: [completedSequence, validationSequence] }],
+	});
+	assert.equal(lastLoopState(harness).state, "complete");
+	const assessments = loopEvents(harness).filter((event) => event.kind === "supervisor.assessment");
+	assert.deepEqual(assessments.map((event) => event.payload), [{
+		requirementId: "1",
+		verdict: "satisfied",
+		references: [{ runId, sequence: completedSequence }, { runId, sequence: validationSequence }],
+	}]);
+	const completedIndex = loopEvents(harness).findIndex((event) => event.kind === "loop.completed");
+	assert.ok(assessments.every((event) => loopEvents(harness).indexOf(event) < completedIndex));
 });
 
 test("loop_delegate rejects ineligible structured authority without adding facts or terminal fields", async () => {

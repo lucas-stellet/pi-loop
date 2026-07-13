@@ -15,20 +15,37 @@ type JournalEvidenceEvent = {
 	payload: Record<string, unknown>;
 };
 
+const SEMANTIC_COMPLETION_KINDS = new Set([
+	"workspace.changed",
+	"validation.completed",
+	"review.completed",
+	"nit.recorded",
+	"blocker.raised",
+	"failure.recorded",
+	"retry.recorded",
+]);
+
 /**
  * Sequences that may ground completion summary/assessment evidence.
- * Launch bookkeeping (`delegation.updated` without status `completed`) is excluded.
+ * Only current-run members of the closed typed-fact allowlist, plus
+ * `delegation.updated` with exact status `completed`, qualify. Undefined active
+ * run identity fails closed.
  */
 export function semanticCompletionSequences(
 	events: readonly JournalEvidenceEvent[],
 	runId: string | undefined,
 ): Set<number> {
+	if (runId === undefined) {
+		return new Set();
+	}
+
 	return new Set(
 		events
 			.filter(
 				(event) =>
 					event.runId === runId &&
-					(event.kind !== "delegation.updated" || event.payload.status === "completed"),
+					(SEMANTIC_COMPLETION_KINDS.has(event.kind) ||
+						(event.kind === "delegation.updated" && event.payload.status === "completed")),
 			)
 			.map((event) => event.sequence),
 	);
