@@ -83,8 +83,10 @@ export async function validateCompletionSummary(
 }
 
 /**
- * Validate that every requirement has an assessment and that cited sequences
- * exist in the active run. Does not judge semantic sufficiency of verdicts.
+ * Validate a one-to-one mapping between projected requirements and assessments,
+ * then check that the sole match for each requirement cites current-run sequences.
+ * Rejects missing, duplicate (including alias collisions), unknown, and ambiguous
+ * assessments. Does not judge semantic sufficiency of verdicts.
  */
 export function validateAssessmentProvenance(
 	requirements: string[],
@@ -99,6 +101,18 @@ export function validateAssessmentProvenance(
 		return "Completion assessments are missing.";
 	}
 
+	for (const assessment of assessments) {
+		const matches = requirements.filter((requirement, index) =>
+			assessmentCoversRequirement(assessment, index, requirement),
+		);
+		if (matches.length === 0) {
+			return `Unknown requirement assessment ${assessment.requirementId.trim()}.`;
+		}
+		if (matches.length > 1) {
+			return `Assessment ${assessment.requirementId.trim()} matches multiple requirements.`;
+		}
+	}
+
 	for (let index = 0; index < requirements.length; index += 1) {
 		const requirement = requirements[index]!;
 		const matches = assessments.filter((assessment) =>
@@ -107,17 +121,19 @@ export function validateAssessmentProvenance(
 		if (matches.length === 0) {
 			return `Requirement ${index + 1} is missing an assessment.`;
 		}
-		for (const assessment of matches) {
-			if (!assessment.verdict.trim()) {
-				return `Requirement ${index + 1} assessment is missing a verdict.`;
-			}
-			if (assessment.eventSequences.length === 0) {
-				return `Requirement ${index + 1} assessment is missing event references.`;
-			}
-			for (const sequence of assessment.eventSequences) {
-				if (!knownEventSequences.has(sequence)) {
-					return `Requirement ${index + 1} cites missing or cross-run event sequence ${sequence}.`;
-				}
+		if (matches.length > 1) {
+			return `Requirement ${index + 1} has a duplicate assessment.`;
+		}
+		const assessment = matches[0]!;
+		if (!assessment.verdict.trim()) {
+			return `Requirement ${index + 1} assessment is missing a verdict.`;
+		}
+		if (assessment.eventSequences.length === 0) {
+			return `Requirement ${index + 1} assessment is missing event references.`;
+		}
+		for (const sequence of assessment.eventSequences) {
+			if (!knownEventSequences.has(sequence)) {
+				return `Requirement ${index + 1} cites missing or cross-run event sequence ${sequence}.`;
 			}
 		}
 	}

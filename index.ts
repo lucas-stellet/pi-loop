@@ -422,17 +422,16 @@ export default function piLoop(
 		name: "loop_complete",
 		label: "Loop Complete",
 		description:
-			"Complete loop supervisor mode after verifying each requirement against evidence. Optional assessments cite projected current-run event sequences.",
+			"Complete loop supervisor mode after verifying each requirement against evidence. Assessments cite projected current-run event sequences.",
 		parameters: Type.Object({
 			summary: Type.String(),
-			assessments: Type.Optional(
-				Type.Array(
-					Type.Object({
-						requirementId: Type.String(),
-						verdict: Type.String(),
-						eventSequences: Type.Array(Type.Number()),
-					}),
-				),
+			assessments: Type.Array(
+				Type.Object({
+					requirementId: Type.String(),
+					verdict: Type.String(),
+					eventSequences: Type.Array(Type.Number()),
+				}),
+				{ minItems: 1 },
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -447,7 +446,7 @@ export default function piLoop(
 			});
 			const assessmentError =
 				assessments.length === 0
-					? undefined
+					? "Completion assessments are missing."
 					: validateAssessmentProvenance(loopState.requirements, assessments, knownEventSequences);
 			const error = summaryError ?? assessmentError;
 			if (error) {
