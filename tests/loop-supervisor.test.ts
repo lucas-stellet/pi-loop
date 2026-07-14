@@ -1247,27 +1247,102 @@ test("mirror poisoning rejects later publication without snapshots or continuati
 	});
 });
 
-test("loop_complete accepts a cited non-empty current-run control artifact for each requirement", async () => {
+test("loop_complete journals each multi-requirement assessment with its canonical evidence before completion", async () => {
 	await withTemporaryCwd(async (cwd) => {
 		const harness = createHarness({ cwd });
 		installLoop(harness, { delegateExecutor: completedDelegateExecutor() });
 		await executeTool(harness, "loop_start", {
 			objective: "Requirements:\n1. Record the plan.\n2. Record the verification.",
 		});
-		await executeTool(harness, "loop_delegate", { name: "delegate", task: "Verify the control artifacts" });
-		const completedSequence = await completedDelegationSequence(harness, "completed delegation evidence was not published");
+		const runId = lastLoopState(harness).runId as string;
+		await executeTool(harness, "loop_delegate", { name: "delegate", task: "Verify the plan" });
+		await executeTool(harness, "loop_delegate", { name: "delegate", task: "Verify the evidence" });
+		await waitUntil(
+			() => loopEvents(harness).filter((event) => event.kind === "delegation.updated" && (event.payload as { status?: unknown }).status === "completed").length === 2,
+			"both completed delegation evidence records were not published",
+		);
+		const completedSequences = loopEvents(harness)
+			.filter((event) => event.kind === "delegation.updated" && (event.payload as { status?: unknown }).status === "completed")
+			.map((event) => event.sequence)
+			.filter((sequence): sequence is number => typeof sequence === "number");
+		assert.equal(completedSequences.length, 2);
 		await executeTool(harness, "loop_write", { file: "plan.md", content: "implemented plan" });
 		await executeTool(harness, "loop_write", { file: "evidence.md", content: "verification passed" });
 
 		const complete = await executeTool(harness, "loop_complete", {
 			summary: "Requirement 1: Evidence: plan.md.\nRequirement 2: Evidence: evidence.md.",
 			assessments: [
-				{ requirementId: "1", verdict: "satisfied", eventSequences: [completedSequence] },
-				{ requirementId: "2", verdict: "satisfied", eventSequences: [completedSequence] },
+				{ requirementId: "1", verdict: "satisfied", eventSequences: [completedSequences[0]!] },
+				{ requirementId: "2", verdict: "satisfied", eventSequences: [completedSequences[1]!] },
 			],
 		});
 		assert.match(resultText(complete), /complete/i);
 		assert.equal(lastLoopState(harness).state, "complete");
+
+		const canonicalEvents = await readOriginCanonicalEvents(cwd, runId);
+		const assessments = canonicalEvents.filter((event) => event.kind === "supervisor.assessment");
+		assert.deepEqual(assessments.map((event) => event.payload), [
+			{ requirementId: "1", verdict: "satisfied", references: [{ runId, sequence: completedSequences[0] }] },
+			{ requirementId: "2", verdict: "satisfied", references: [{ runId, sequence: completedSequences[1] }] },
+		]);
+		const completionIndex = canonicalEvents.findIndex((event) => event.kind === "loop.completed");
+		assert.equal(canonicalEvents.filter((event) => event.kind === "loop.completed").length, 1);
+		assert.ok(assessments.every((event) => canonicalEvents.indexOf(event) < completionIndex));
+	});
+});
+
+test("loop_complete fails closed when the canonical completion write fails before commit", async () => {
+	await withTemporaryCwd(async (cwd) => {
+		const harness = createHarness({ cwd });
+		installLoop(harness, { delegateExecutor: completedDelegateExecutor() });
+		await executeTool(harness, "loop_start", { objective: "Requirements:\n1. Settle only after journaling." });
+		const runId = lastLoopState(harness).runId as string;
+		await executeTool(harness, "loop_delegate", { name: "delegate", task: "Produce completion evidence" });
+		const completedSequence = await completedDelegationSequence(harness, "completed delegation evidence was not published");
+		await waitUntil(
+			() => lastLoopState(harness).sequence === completedSequence,
+			"completed delegation snapshot was not persisted",
+		);
+		const snapshotsBefore = harness.appendEntries.filter((entry) => entry.customType === "loop-state").length;
+		const toolCallsBefore = harness.setActiveToolsCalls.length;
+
+		await withFileHandleMethod(
+			"writeFile",
+			(original) => async function writeFile(this: FileHandle, data: string | Uint8Array, options?: unknown) {
+				const text = typeof data === "string" ? data : Buffer.from(data).toString("utf8");
+				if (text.includes('"kind":"loop.completed"')) throw new Error("completion disk append failed");
+				return (original as (data: string | Uint8Array, options?: unknown) => Promise<void>).call(this, data, options);
+			},
+			async () => {
+				await assert.rejects(
+					() => executeTool(harness, "loop_complete", {
+						summary: `Requirement 1: Evidence: #${completedSequence}.`,
+						assessments: [{ requirementId: "1", verdict: "satisfied", eventSequences: [completedSequence] }],
+					}),
+					/completion disk append failed/,
+				);
+			},
+		);
+
+		assert.equal(lastLoopState(harness).state, "active");
+		assert.deepEqual(harness.activeTools, SUPERVISOR_TOOLS);
+		assert.equal(harness.setActiveToolsCalls.length, toolCallsBefore);
+		assert.equal(harness.appendEntries.filter((entry) => entry.customType === "loop-state").length, snapshotsBefore);
+		const status = await executeTool(harness, "loop_status", {});
+		assert.match(resultText(status), /active/i);
+		const guard = requiredHandler(harness, "tool_call", "runtime guard required");
+		assert.deepEqual(guard({ type: "tool_call", toolCallId: "blocked", toolName: "bash", input: {} }, harness.ctx), {
+			block: true,
+			reason: "Loop mode: tool 'bash' is not on the supervisor allowlist.",
+		});
+		await requiredHandler(harness, "agent_end", "continuation hook required")({ type: "agent_end", messages: [] }, harness.ctx);
+		assert.equal(harness.sentMessages.length, 0);
+		const entriesAfterFailure = harness.appendEntries.length;
+		await assert.rejects(() => executeTool(harness, "loop_clear", {}), /unhealthy|completion disk append failed/i);
+		assert.equal(harness.appendEntries.length, entriesAfterFailure);
+		const canonicalEvents = await readOriginCanonicalEvents(cwd, runId);
+		assert.equal(canonicalEvents.some((event) => event.kind === "loop.completed"), false);
+		assert.equal(canonicalEvents.filter((event) => event.kind === "supervisor.assessment").length, 1);
 	});
 });
 
