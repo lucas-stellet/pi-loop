@@ -33,7 +33,7 @@ Add a loop journal and state model that records every important loop event befor
 - Define event kinds for loop lifecycle, supervisor decisions, delegations, retries, guardrail violations, budget updates, nits, evidence, completion, pause, resume, and failure.
 - Build deterministic projections from events for current state and supervisor context. Projections identify observable facts, missing data, stale references, contradictions, and unresolved blockers without deciding semantic objective completion.
 - Inject the compact projection into supervisor turns so the model evaluates relevant context rather than scanning raw JSONL or child logs.
-- Record the supervisor's requirement assessments and evidence references as events. The completion tool validates assessment shape and event provenance before appending the terminal completion event.
+- Every `loop_complete` call requires a non-empty structured assessment set with exactly one assessment for every projected requirement, alongside its required textual summary. Record the supervisor's requirement assessments and evidence references as events; the completion tool validates assessment shape and event provenance before appending the terminal completion event.
 - Provide status and result tools or commands that read projections and structured state rather than scraping chat output.
 - Keep full child artifacts available but return concise projected summaries to the supervisor to avoid context blowup.
 - Record token usage, duration, attempts, and result classification per delegation.
@@ -47,7 +47,7 @@ Add a loop journal and state model that records every important loop event befor
 - Tests should verify that each lifecycle transition writes the expected event kind.
 - Tests should verify deterministic projections for lifecycle, delegation, validation, review, blocker, and requirement-reference events.
 - Tests should verify that supervisor context is bounded and derived from projections without raw-log scanning.
-- Tests should verify that completion rejects missing, stale, cross-run, or fabricated event references while leaving semantic sufficiency to the supervisor.
+- Tests should verify that completion rejects omitted or incomplete assessment sets and missing, stale, cross-run, or fabricated event references while leaving semantic sufficiency to the supervisor.
 - Tests should verify that status is reconstructed from persisted state after reload.
 - Tests should verify that delegated run summaries link back to full artifacts.
 - Tests should verify that guardrail violations are recorded before being returned to the supervisor.

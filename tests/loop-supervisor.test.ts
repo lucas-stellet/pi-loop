@@ -281,16 +281,36 @@ function loopEvents(harness: ReturnType<typeof createHarness>) {
 /** Bound elapsed-time wait for a real completed delegation event; never fabricates sequences. */
 const COMPLETED_DELEGATION_WAIT_MS = 5_000;
 
-async function completedDelegationSequence(harness: ReturnType<typeof createHarness>, message: string): Promise<number> {
+async function completedDelegationSequence(
+	harness: ReturnType<typeof createHarness>,
+	message: string,
+	runId?: string,
+): Promise<number> {
 	const deadline = Date.now() + COMPLETED_DELEGATION_WAIT_MS;
 	while (Date.now() < deadline) {
 		const sequence = loopEvents(harness).find((event) =>
-			event.kind === "delegation.updated" && (event.payload as { status?: unknown }).status === "completed",
+			event.kind === "delegation.updated"
+			&& (event.payload as { status?: unknown }).status === "completed"
+			&& (runId === undefined || event.runId === runId),
 		)?.sequence;
 		if (typeof sequence === "number") return sequence;
 		await new Promise<void>((resolve) => setImmediate(resolve));
 	}
 	throw new Error(message);
+}
+
+async function completedAssessment(
+	harness: ReturnType<typeof createHarness>,
+	task: string,
+	verdict = "satisfied",
+): Promise<Array<{ requirementId: string; verdict: string; eventSequences: number[] }>> {
+	await executeTool(harness, "loop_delegate", { name: "delegate", task });
+	const completedSequence = await completedDelegationSequence(
+		harness,
+		"completed delegation evidence was not published",
+		lastLoopState(harness).runId as string,
+	);
+	return [{ requirementId: "1", verdict, eventSequences: [completedSequence] }];
 }
 
 function childRuntimeRefs(childId: string) {
@@ -950,9 +970,26 @@ test("loop_complete rejects empty, contradictory, word-only, and missing evidenc
 			"2. Prohibited built-in tools are blocked at runtime.",
 		].join("\n"),
 	});
+	await executeTool(harness, "loop_delegate", {
+		name: "delegate",
+		task: "Verify restricted supervisor tools are installed",
+	});
+	await executeTool(harness, "loop_delegate", {
+		name: "delegate",
+		task: "Verify the runtime guard blocks prohibited built-ins",
+	});
+	const completedSequence = await completedDelegationSequence(
+		harness,
+		"completed delegation evidence was not published",
+		lastLoopState(harness).runId as string,
+	);
+	const assessments = [
+		{ requirementId: "1", verdict: "satisfied", eventSequences: [completedSequence] },
+		{ requirementId: "2", verdict: "satisfied", eventSequences: [completedSequence] },
+	];
 
 	await assert.rejects(
-		() => executeTool(harness, "loop_complete", { summary: "" }),
+		() => executeTool(harness, "loop_complete", { summary: "", assessments }),
 		/empty|summary/i,
 	);
 	assert.equal(lastLoopState(harness).state, "active");
@@ -961,6 +998,7 @@ test("loop_complete rejects empty, contradictory, word-only, and missing evidenc
 		() =>
 			executeTool(harness, "loop_complete", {
 				summary: "Requirement 1 is complete with evidence, but Requirement 2 is not complete.",
+				assessments,
 			}),
 		/contradict/i,
 	);
@@ -970,6 +1008,7 @@ test("loop_complete rejects empty, contradictory, word-only, and missing evidenc
 		() =>
 			executeTool(harness, "loop_complete", {
 				summary: "Requirement 1: verified with delegated evidence from tests/tool-guard.test.ts.",
+				assessments,
 			}),
 		/Requirement 2|missing evidence/i,
 	);
@@ -982,20 +1021,12 @@ test("loop_complete rejects empty, contradictory, word-only, and missing evidenc
 					"Requirement 1: verified. Evidence.",
 					"Requirement 2: verified. Evidence.",
 				].join("\n"),
+				assessments,
 			}),
 		/missing evidence|Requirement 1/i,
 	);
 	assert.equal(lastLoopState(harness).state, "active");
 
-	await executeTool(harness, "loop_delegate", {
-		name: "delegate",
-		task: "Verify restricted supervisor tools are installed",
-	});
-	await executeTool(harness, "loop_delegate", {
-		name: "delegate",
-		task: "Verify the runtime guard blocks prohibited built-ins",
-	});
-	const completedSequence = await completedDelegationSequence(harness, "completed delegation evidence was not published");
 	await executeTool(harness, "loop_write", { file: "plan.md", content: "verified" });
 	await executeTool(harness, "loop_write", { file: "evidence.md", content: "verified" });
 	const delegationEntries = harness.appendEntries.filter((entry) => entry.customType === "loop-delegation");
@@ -1009,10 +1040,7 @@ test("loop_complete rejects empty, contradictory, word-only, and missing evidenc
 			"Requirement 1: verified. Evidence: plan.md.",
 			"Requirement 2: verified. Evidence: evidence.md.",
 		].join("\n"),
-		assessments: [
-			{ requirementId: "1", verdict: "satisfied", eventSequences: [completedSequence] },
-			{ requirementId: "2", verdict: "satisfied", eventSequences: [completedSequence] },
-		],
+		assessments,
 	});
 	assert.match(resultText(complete), /complete/i);
 	assert.equal(lastLoopState(harness).state, "complete");
@@ -1149,7 +1177,11 @@ test("terminal lifecycle facts mirror only while state and supervisor restrictio
 			kind: "loop.failed",
 			state: "failed",
 			async finish(harness) {
-				await assert.rejects(() => executeTool(harness, "loop_complete", { summary: "Requirement 1 failed." }));
+				const assessments = await completedAssessment(harness, "Record failure evidence", "failed");
+				await assert.rejects(() => executeTool(harness, "loop_complete", {
+					summary: "Requirement 1 failed.",
+					assessments,
+				}));
 			},
 		},
 		{
@@ -1190,7 +1222,7 @@ test("terminal lifecycle facts mirror only while state and supervisor restrictio
 						assert.deepEqual(JSON.parse(disk.trimEnd().split("\n").at(-1)!), event);
 					},
 				});
-				installLoop(harness, terminal.kind === "loop.completed" ? { delegateExecutor: completedDelegateExecutor() } : {});
+				installLoop(harness, terminal.kind === "loop.budget_limited" ? {} : { delegateExecutor: completedDelegateExecutor() });
 				await executeTool(harness, "loop_start", { objective: "Terminal fact", maxIterations: 1 });
 				await terminal.finish(harness);
 				assert.equal(observedMirror, true);
@@ -1351,29 +1383,32 @@ test("loop_complete rejects delegation and artifact citations that are not safe 
 
 	await withTemporaryCwd(async (cwd) => {
 		const harness = createHarness({ cwd });
-		installLoop(harness);
+		installLoop(harness, { delegateExecutor: completedDelegateExecutor() });
 		await executeTool(harness, "loop_start", { objective: "Use only current-run evidence" });
 		await executeTool(harness, "loop_delegate", { name: "delegate", task: "prior-run delegated task" });
 		await executeTool(harness, "loop_write", { file: "evidence.md", content: "old evidence" });
 		await executeTool(harness, "loop_clear", {});
 		await executeTool(harness, "loop_start", { objective: "Use only current-run evidence" });
+		const assessments = await completedAssessment(harness, "Record active-run assessment evidence");
 
 		await assert.rejects(
-			() => executeTool(harness, "loop_complete", { summary: "Requirement 1: prior-run delegated task." }),
+			() => executeTool(harness, "loop_complete", { summary: "Requirement 1: prior-run delegated task.", assessments }),
 			/missing evidence|Requirement 1/i,
 		);
-		await assert.rejects(() => executeTool(harness, "loop_complete", { summary: rejectedSummary }), /missing evidence|Requirement 1/i);
+		await assert.rejects(() => executeTool(harness, "loop_complete", { summary: rejectedSummary, assessments }), /missing evidence|Requirement 1/i);
 	});
 
 	await withTemporaryCwd(async (cwd) => {
 		const harness = createHarness({ cwd });
-		installLoop(harness);
+		installLoop(harness, { delegateExecutor: completedDelegateExecutor() });
 		await executeTool(harness, "loop_start", { objective: "Reject embedded artifact names" });
+		const assessments = await completedAssessment(harness, "Record assessment evidence");
 
 		await assert.rejects(
 			() =>
 				executeTool(harness, "loop_complete", {
 					summary: "Requirement 1: Evidence: nonexistent-objective.md.",
+					assessments,
 				}),
 			/missing evidence|Requirement 1/i,
 			"an approved basename embedded in another filename must not count as evidence",
@@ -1382,18 +1417,20 @@ test("loop_complete rejects delegation and artifact citations that are not safe 
 
 	await withTemporaryCwd(async (cwd) => {
 		const harness = createHarness({ cwd });
-		installLoop(harness);
+		installLoop(harness, { delegateExecutor: completedDelegateExecutor() });
 		await executeTool(harness, "loop_start", { objective: "Create an earlier run" });
 		const priorRunId = lastLoopState(harness).runId;
 		assert.equal(typeof priorRunId, "string");
 		await executeTool(harness, "loop_clear", {});
 		await executeTool(harness, "loop_start", { objective: "Reject prior-run artifact paths" });
 		await executeTool(harness, "loop_write", { file: "evidence.md", content: "current evidence" });
+		const assessments = await completedAssessment(harness, "Record assessment evidence");
 
 		await assert.rejects(
 			() =>
 				executeTool(harness, "loop_complete", {
 					summary: `Requirement 1: Evidence: .pi/loop/${priorRunId}/evidence.md.`,
+					assessments,
 				}),
 			/missing evidence|Requirement 1/i,
 			"a prior-run path must not alias the active run's artifact",
@@ -1403,8 +1440,9 @@ test("loop_complete rejects delegation and artifact citations that are not safe 
 	for (const unsafeArtifact of ["missing", "whitespace", "symlink", "hard-link"] as const) {
 		await withTemporaryCwd(async (cwd) => {
 			const harness = createHarness({ cwd });
-			installLoop(harness);
+			installLoop(harness, { delegateExecutor: completedDelegateExecutor() });
 			await executeTool(harness, "loop_start", { objective: "Reject unsafe evidence artifacts" });
+			const assessments = await completedAssessment(harness, "Record assessment evidence");
 			const evidencePath = join(activeControlDirectory(harness), "evidence.md");
 			if (unsafeArtifact === "whitespace") {
 				await writeFile(evidencePath, " \n\t", "utf8");
@@ -1419,7 +1457,7 @@ test("loop_complete rejects delegation and artifact citations that are not safe 
 			}
 
 			await assert.rejects(
-				() => executeTool(harness, "loop_complete", { summary: rejectedSummary }),
+				() => executeTool(harness, "loop_complete", { summary: rejectedSummary, assessments }),
 				/missing evidence|Requirement 1/i,
 				`${unsafeArtifact} artifact must not count as completion evidence`,
 			);
@@ -1455,7 +1493,7 @@ test("agent_end suppresses continuation for pending input and every non-active l
 
 	for (const state of ["paused", "complete", "budget_limited", "failed", "idle"] as const) {
 		const harness = createHarness();
-		installLoop(harness, state === "complete" ? { delegateExecutor: completedDelegateExecutor() } : {});
+		installLoop(harness, ["complete", "failed"].includes(state) ? { delegateExecutor: completedDelegateExecutor() } : {});
 		await executeTool(harness, "loop_start", { objective: "Suppress terminal continuation", maxIterations: 1 });
 		if (state === "paused") {
 			await executeTool(harness, "loop_pause", {});
@@ -1470,7 +1508,11 @@ test("agent_end suppresses continuation for pending input and every non-active l
 		} else if (state === "budget_limited") {
 			await requiredHandler(harness, "agent_start", "iteration hook required")({ type: "agent_start" }, harness.ctx);
 		} else if (state === "failed") {
-			await assert.rejects(() => executeTool(harness, "loop_complete", { summary: "Requirement 1 failed." }));
+			const assessments = await completedAssessment(harness, "Record failure evidence", "failed");
+			await assert.rejects(() => executeTool(harness, "loop_complete", {
+				summary: "Requirement 1 failed.",
+				assessments,
+			}));
 		} else {
 			await executeTool(harness, "loop_clear", {});
 		}
@@ -1552,13 +1594,15 @@ test("agent_start counts automatic continuations against maxIterations without d
 
 test("loop_complete failure summaries reject, persist failed, restore tools, and permanently stop continuation", async () => {
 	const harness = createHarness();
-	installLoop(harness);
+	installLoop(harness, { delegateExecutor: completedDelegateExecutor() });
 	await executeTool(harness, "loop_start", { objective: "Make failed loop state observable" });
+	const assessments = await completedAssessment(harness, "Record failure evidence", "failed");
 
 	await assert.rejects(
 		() =>
 			executeTool(harness, "loop_complete", {
 				summary: "The delegated implementation failed. Evidence: npm test is still failing.",
+				assessments,
 			}),
 		/failed|failing|contradict/i,
 	);
@@ -3395,36 +3439,47 @@ test("loop_complete journals assessments and rejects missing or cross-run event 
 	assert.equal(lastLoopState(harness).state, "active");
 });
 
-test("summary completion rejects a started-only delegation sequence as semantic evidence", async () => {
+test("loop_complete rejects a started-only delegation sequence as summary evidence", async () => {
 	const harness = createHarness();
-	installLoop(harness);
+	installLoop(harness, { delegateExecutor: completedDelegateExecutor() });
 	await executeTool(harness, "loop_start", {
 		objective: "Requirements:\n1. Ship the feature.",
 	});
 	await executeTool(harness, "loop_delegate", { name: "delegate", task: "Ship it" });
-	const delegationSequence = loopEvents(harness).find((event) => event.kind === "delegation.updated")?.sequence;
-	assert.equal(typeof delegationSequence, "number");
+	const startedSequence = loopEvents(harness).find(
+		(event) => event.kind === "delegation.updated" && (event.payload as { status?: unknown }).status === "started",
+	)?.sequence;
+	assert.equal(typeof startedSequence, "number");
+	const completedSequence = await completedDelegationSequence(
+		harness,
+		"completed delegation evidence was not published",
+		lastLoopState(harness).runId as string,
+	);
+	const assessments = [{ requirementId: "1", verdict: "satisfied", eventSequences: [completedSequence] }];
 
 	await assert.rejects(
 		() =>
 			executeTool(harness, "loop_complete", {
-				summary: `Requirement 1: verified. Evidence: #${delegationSequence}.`,
+				summary: `Requirement 1: verified. Evidence: #${startedSequence}.`,
+				assessments,
 			}),
 		/missing evidence|Requirement 1/i,
 	);
 	assert.equal(lastLoopState(harness).state, "active");
 });
 
-test("summary completion rejects operational event evidence and leaves the loop active", async () => {
+test("loop_complete rejects operational event summary evidence and leaves the loop active", async () => {
 	const harness = createHarness();
-	installLoop(harness);
+	installLoop(harness, { delegateExecutor: completedDelegateExecutor() });
 	await executeTool(harness, "loop_start", { objective: "Requirements:\n1. Ship the feature." });
 	const startedSequence = loopEvents(harness).find((event) => event.kind === "loop.started")?.sequence;
 	assert.equal(typeof startedSequence, "number");
+	const assessments = await completedAssessment(harness, "Record assessment evidence");
 
 	await assert.rejects(
 		() => executeTool(harness, "loop_complete", {
 			summary: `Requirement 1: verified. Evidence: #${startedSequence}.`,
+			assessments,
 		}),
 		/missing evidence|Requirement 1/i,
 	);

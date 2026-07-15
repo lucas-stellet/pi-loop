@@ -33,9 +33,9 @@ The loop ends only when the supervisor calls an explicit completion tool after j
 - Supervisor tools are limited to loop control, markdown control-file updates, delegation, status inspection, and completion.
 - The supervisor may write only loop-scoped markdown control artifacts. It may not write implementation files or arbitrary project files.
 - The supervisor receives an injected prompt that defines its role as orchestrator, not executor.
-- Completion requires a dedicated completion tool. The completion tool rejects empty, contradictory, structurally incomplete, or ungrounded assessments.
+- Completion requires a dedicated completion tool. Every `loop_complete` call requires a textual summary and a non-empty structured assessment set with exactly one assessment for every projected requirement; the completion tool rejects empty, contradictory, structurally incomplete, or ungrounded assessments.
 - The supervisor makes the semantic decision to continue or complete after reviewing a deterministic projection of current-run facts grouped by requirement.
-- Completion validation checks that every requirement was assessed and that cited event references exist, belong to the active run, and are represented accurately; it does not decide whether the evidence is semantically sufficient.
+- Completion validation checks assessment structure and that cited event references exist, belong to the active run, and are represented accurately; it does not decide whether the evidence is semantically sufficient.
 - Markdown control files are human-readable planning and decision artifacts, not the authoritative source for runtime evidence or terminal state.
 - The supervisor should prefer delegation over direct work whenever it needs code context, implementation, testing, review, or external task-tracker inspection.
 - The system should keep loop state independent from normal chat context where possible, while still surfacing concise status to the user.
@@ -47,7 +47,7 @@ The loop ends only when the supervisor calls an explicit completion tool after j
 - Add tests for starting loop mode, pausing, resuming, budget limiting, and completion.
 - Add tests proving prohibited built-in tools are blocked during loop mode.
 - Add tests proving markdown writes outside the loop control scope are rejected.
-- Add tests proving completion fails when the summary is contradictory or evidence is missing.
+- Add tests proving completion fails when its required summary is contradictory or evidence is missing, or its required assessment set is omitted, incomplete, or ungrounded.
 - Add tests for session reload and compaction recovery.
 - Avoid testing prompt wording as implementation detail except where wording is part of the public contract shown to the model.
 
